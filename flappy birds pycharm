@@ -1,0 +1,635 @@
+import random
+import time
+from collections import deque
+
+import cv2
+import numpy as np
+import serial
+
+
+# -------------------------------------------------
+# ARDUINO SETTINGS
+# -------------------------------------------------
+
+ARDUINO_PORT = "COM5"  # Change this to your Arduino port
+BAUD_RATE = 9600
+
+
+# -------------------------------------------------
+# GAME SETTINGS
+# -------------------------------------------------
+
+WINDOW_WIDTH = 1000
+WINDOW_HEIGHT = 600
+
+BIRD_X = 220
+BIRD_RADIUS = 22
+
+PIPE_WIDTH = 90
+PIPE_GAP = 190
+PIPE_SPEED = 240  # Pixels per second
+PIPE_SPAWN_TIME = 1.8
+
+TOP_MARGIN = 50
+BOTTOM_MARGIN = 50
+
+MAX_SMOOTHING_VALUES = 8
+
+
+# -------------------------------------------------
+# CONNECT TO ARDUINO
+# -------------------------------------------------
+
+try:
+    arduino = serial.Serial(
+        port=ARDUINO_PORT,
+        baudrate=BAUD_RATE,
+        timeout=0.05
+    )
+
+except serial.SerialException as error:
+    raise SystemExit(
+        f"Could not open {ARDUINO_PORT}\n"
+        f"Close Arduino Serial Monitor and check the COM port.\n"
+        f"Error: {error}"
+    )
+
+
+print("Connecting to Arduino...")
+time.sleep(2)
+
+arduino.reset_input_buffer()
+
+print("Arduino connected!")
+print("Rotate the potentiometer to move the bird.")
+print("Press R to restart and Q to quit.")
+
+
+# -------------------------------------------------
+# VARIABLES
+# -------------------------------------------------
+
+potentiometer_values = deque(maxlen=MAX_SMOOTHING_VALUES)
+
+current_potentiometer_value = 512
+bird_y = WINDOW_HEIGHT // 2
+
+pipes = []
+
+score = 0
+high_score = 0
+
+game_over = False
+
+last_pipe_spawn = time.time()
+previous_frame_time = time.time()
+
+
+# -------------------------------------------------
+# HELPER FUNCTIONS
+# -------------------------------------------------
+
+def reset_game():
+    global pipes
+    global score
+    global game_over
+    global last_pipe_spawn
+    global previous_frame_time
+
+    pipes = []
+    score = 0
+    game_over = False
+
+    last_pipe_spawn = time.time()
+    previous_frame_time = time.time()
+
+
+def read_potentiometer():
+    global current_potentiometer_value
+
+    while arduino.in_waiting > 0:
+        serial_text = arduino.readline().decode(
+            "utf-8",
+            errors="ignore"
+        ).strip()
+
+        if not serial_text:
+            continue
+
+        try:
+            # Also works if Arduino sends "value,voltage"
+            value_text = serial_text.split(",")[0]
+
+            value = int(value_text)
+
+            value = max(0, min(1023, value))
+
+            current_potentiometer_value = value
+            potentiometer_values.append(value)
+
+        except ValueError:
+            continue
+
+    if potentiometer_values:
+        return int(
+            sum(potentiometer_values)
+            / len(potentiometer_values)
+        )
+
+    return current_potentiometer_value
+
+
+def map_potentiometer_to_height(value):
+    minimum_y = TOP_MARGIN + BIRD_RADIUS
+    maximum_y = WINDOW_HEIGHT - BOTTOM_MARGIN - BIRD_RADIUS
+
+    normalized_value = value / 1023.0
+
+    # Higher potentiometer value moves bird upward
+    mapped_y = maximum_y - (
+        normalized_value * (maximum_y - minimum_y)
+    )
+
+    return int(mapped_y)
+
+
+def create_pipe():
+    minimum_gap_center = TOP_MARGIN + PIPE_GAP // 2 + 30
+
+    maximum_gap_center = (
+        WINDOW_HEIGHT
+        - BOTTOM_MARGIN
+        - PIPE_GAP // 2
+        - 30
+    )
+
+    gap_center = random.randint(
+        minimum_gap_center,
+        maximum_gap_center
+    )
+
+    return {
+        "x": float(WINDOW_WIDTH),
+        "gap_center": gap_center,
+        "scored": False
+    }
+
+
+def circle_rectangle_collision(
+    circle_x,
+    circle_y,
+    circle_radius,
+    rectangle_left,
+    rectangle_top,
+    rectangle_right,
+    rectangle_bottom
+):
+    closest_x = max(
+        rectangle_left,
+        min(circle_x, rectangle_right)
+    )
+
+    closest_y = max(
+        rectangle_top,
+        min(circle_y, rectangle_bottom)
+    )
+
+    distance_x = circle_x - closest_x
+    distance_y = circle_y - closest_y
+
+    distance_squared = (
+        distance_x * distance_x
+        + distance_y * distance_y
+    )
+
+    return distance_squared <= circle_radius * circle_radius
+
+
+def check_pipe_collision(pipe):
+    pipe_left = int(pipe["x"])
+    pipe_right = pipe_left + PIPE_WIDTH
+
+    gap_top = pipe["gap_center"] - PIPE_GAP // 2
+    gap_bottom = pipe["gap_center"] + PIPE_GAP // 2
+
+    top_pipe_collision = circle_rectangle_collision(
+        BIRD_X,
+        bird_y,
+        BIRD_RADIUS,
+        pipe_left,
+        0,
+        pipe_right,
+        gap_top
+    )
+
+    bottom_pipe_collision = circle_rectangle_collision(
+        BIRD_X,
+        bird_y,
+        BIRD_RADIUS,
+        pipe_left,
+        gap_bottom,
+        pipe_right,
+        WINDOW_HEIGHT
+    )
+
+    return top_pipe_collision or bottom_pipe_collision
+
+
+def draw_background(canvas):
+    canvas[:] = (235, 210, 140)
+
+    # Clouds
+    cv2.circle(canvas, (130, 90), 35, (255, 255, 255), -1)
+    cv2.circle(canvas, (175, 90), 45, (255, 255, 255), -1)
+    cv2.circle(canvas, (220, 90), 30, (255, 255, 255), -1)
+
+    cv2.circle(canvas, (720, 130), 30, (255, 255, 255), -1)
+    cv2.circle(canvas, (760, 120), 45, (255, 255, 255), -1)
+    cv2.circle(canvas, (810, 130), 30, (255, 255, 255), -1)
+
+    # Ground
+    cv2.rectangle(
+        canvas,
+        (0, WINDOW_HEIGHT - BOTTOM_MARGIN),
+        (WINDOW_WIDTH, WINDOW_HEIGHT),
+        (70, 180, 70),
+        -1
+    )
+
+    cv2.line(
+        canvas,
+        (0, WINDOW_HEIGHT - BOTTOM_MARGIN),
+        (WINDOW_WIDTH, WINDOW_HEIGHT - BOTTOM_MARGIN),
+        (40, 110, 40),
+        4
+    )
+
+
+def draw_pipe(canvas, pipe):
+    pipe_left = int(pipe["x"])
+    pipe_right = pipe_left + PIPE_WIDTH
+
+    gap_top = pipe["gap_center"] - PIPE_GAP // 2
+    gap_bottom = pipe["gap_center"] + PIPE_GAP // 2
+
+    pipe_colour = (40, 200, 60)
+    pipe_border = (20, 100, 30)
+
+    # Upper pipe
+    cv2.rectangle(
+        canvas,
+        (pipe_left, 0),
+        (pipe_right, gap_top),
+        pipe_colour,
+        -1
+    )
+
+    cv2.rectangle(
+        canvas,
+        (pipe_left, 0),
+        (pipe_right, gap_top),
+        pipe_border,
+        4
+    )
+
+    # Upper pipe lip
+    cv2.rectangle(
+        canvas,
+        (pipe_left - 8, gap_top - 25),
+        (pipe_right + 8, gap_top),
+        pipe_colour,
+        -1
+    )
+
+    cv2.rectangle(
+        canvas,
+        (pipe_left - 8, gap_top - 25),
+        (pipe_right + 8, gap_top),
+        pipe_border,
+        4
+    )
+
+    # Lower pipe
+    cv2.rectangle(
+        canvas,
+        (pipe_left, gap_bottom),
+        (pipe_right, WINDOW_HEIGHT),
+        pipe_colour,
+        -1
+    )
+
+    cv2.rectangle(
+        canvas,
+        (pipe_left, gap_bottom),
+        (pipe_right, WINDOW_HEIGHT),
+        pipe_border,
+        4
+    )
+
+    # Lower pipe lip
+    cv2.rectangle(
+        canvas,
+        (pipe_left - 8, gap_bottom),
+        (pipe_right + 8, gap_bottom + 25),
+        pipe_colour,
+        -1
+    )
+
+    cv2.rectangle(
+        canvas,
+        (pipe_left - 8, gap_bottom),
+        (pipe_right + 8, gap_bottom + 25),
+        pipe_border,
+        4
+    )
+
+
+def draw_bird(canvas):
+    # Body
+    cv2.circle(
+        canvas,
+        (BIRD_X, bird_y),
+        BIRD_RADIUS,
+        (0, 220, 255),
+        -1
+    )
+
+    cv2.circle(
+        canvas,
+        (BIRD_X, bird_y),
+        BIRD_RADIUS,
+        (20, 80, 150),
+        3
+    )
+
+    # Wing
+    cv2.ellipse(
+        canvas,
+        (BIRD_X - 12, bird_y + 5),
+        (15, 9),
+        0,
+        0,
+        360,
+        (0, 150, 255),
+        -1
+    )
+
+    # Eye
+    cv2.circle(
+        canvas,
+        (BIRD_X + 10, bird_y - 8),
+        7,
+        (255, 255, 255),
+        -1
+    )
+
+    cv2.circle(
+        canvas,
+        (BIRD_X + 12, bird_y - 8),
+        3,
+        (0, 0, 0),
+        -1
+    )
+
+    # Beak
+    beak_points = np.array(
+        [
+            [BIRD_X + 20, bird_y],
+            [BIRD_X + 38, bird_y + 5],
+            [BIRD_X + 20, bird_y + 10]
+        ],
+        dtype=np.int32
+    )
+
+    cv2.fillPoly(
+        canvas,
+        [beak_points],
+        (0, 100, 255)
+    )
+
+
+def draw_information(canvas, potentiometer_value):
+    cv2.putText(
+        canvas,
+        f"SCORE: {score}",
+        (35, 45),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1,
+        (255, 255, 255),
+        3
+    )
+
+    cv2.putText(
+        canvas,
+        f"HIGH SCORE: {high_score}",
+        (710, 45),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2
+    )
+
+    cv2.putText(
+        canvas,
+        f"POT: {potentiometer_value}",
+        (35, WINDOW_HEIGHT - 15),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2
+    )
+
+    # Potentiometer level bar
+    bar_left = 170
+    bar_right = 450
+    bar_top = WINDOW_HEIGHT - 32
+    bar_bottom = WINDOW_HEIGHT - 14
+
+    cv2.rectangle(
+        canvas,
+        (bar_left, bar_top),
+        (bar_right, bar_bottom),
+        (255, 255, 255),
+        2
+    )
+
+    filled_width = int(
+        potentiometer_value
+        / 1023
+        * (bar_right - bar_left)
+    )
+
+    cv2.rectangle(
+        canvas,
+        (bar_left, bar_top),
+        (bar_left + filled_width, bar_bottom),
+        (0, 255, 255),
+        -1
+    )
+
+
+def draw_game_over(canvas):
+    overlay = canvas.copy()
+
+    cv2.rectangle(
+        overlay,
+        (250, 180),
+        (750, 410),
+        (20, 20, 20),
+        -1
+    )
+
+    cv2.addWeighted(
+        overlay,
+        0.8,
+        canvas,
+        0.2,
+        0,
+        canvas
+    )
+
+    cv2.putText(
+        canvas,
+        "GAME OVER",
+        (345, 245),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.4,
+        (0, 0, 255),
+        4
+    )
+
+    cv2.putText(
+        canvas,
+        f"Score: {score}",
+        (420, 300),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (255, 255, 255),
+        2
+    )
+
+    cv2.putText(
+        canvas,
+        "Press R to restart",
+        (345, 350),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.75,
+        (255, 255, 255),
+        2
+    )
+
+    cv2.putText(
+        canvas,
+        "Press Q to quit",
+        (370, 385),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (200, 200, 200),
+        2
+    )
+
+
+# -------------------------------------------------
+# MAIN GAME LOOP
+# -------------------------------------------------
+
+try:
+    reset_game()
+
+    while True:
+        current_time = time.time()
+
+        delta_time = current_time - previous_frame_time
+        previous_frame_time = current_time
+
+        # Prevent very large jumps if the window freezes briefly
+        delta_time = min(delta_time, 0.05)
+
+        potentiometer_value = read_potentiometer()
+
+        target_bird_y = map_potentiometer_to_height(
+            potentiometer_value
+        )
+
+        # Smooth bird movement
+        bird_y = int(
+            bird_y * 0.70
+            + target_bird_y * 0.30
+        )
+
+        if not game_over:
+            if (
+                current_time - last_pipe_spawn
+                >= PIPE_SPAWN_TIME
+            ):
+                pipes.append(create_pipe())
+                last_pipe_spawn = current_time
+
+            for pipe in pipes:
+                pipe["x"] -= PIPE_SPEED * delta_time
+
+                if (
+                    not pipe["scored"]
+                    and pipe["x"] + PIPE_WIDTH < BIRD_X
+                ):
+                    pipe["scored"] = True
+                    score += 1
+
+                    if score > high_score:
+                        high_score = score
+
+                if check_pipe_collision(pipe):
+                    game_over = True
+
+            pipes = [
+                pipe
+                for pipe in pipes
+                if pipe["x"] + PIPE_WIDTH > -20
+            ]
+
+            if (
+                bird_y - BIRD_RADIUS <= 0
+                or bird_y + BIRD_RADIUS
+                >= WINDOW_HEIGHT - BOTTOM_MARGIN
+            ):
+                game_over = True
+
+        frame = np.zeros(
+            (WINDOW_HEIGHT, WINDOW_WIDTH, 3),
+            dtype=np.uint8
+        )
+
+        draw_background(frame)
+
+        for pipe in pipes:
+            draw_pipe(frame, pipe)
+
+        draw_bird(frame)
+        draw_information(frame, potentiometer_value)
+
+        if game_over:
+            draw_game_over(frame)
+
+        cv2.imshow(
+            "Arduino Potentiometer Flappy Bird",
+            frame
+        )
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q"):
+            break
+
+        if key == ord("r"):
+            reset_game()
+
+        if cv2.getWindowProperty(
+            "Arduino Potentiometer Flappy Bird",
+            cv2.WND_PROP_VISIBLE
+        ) < 1:
+            break
+
+finally:
+    arduino.close()
+    cv2.destroyAllWindows()
+    print("Arduino connection closed.")
