@@ -1,0 +1,57 @@
+#define ENA_PIN 4
+#define IN1_PIN 5
+#define IN2_PIN 6
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(IN1_PIN, OUTPUT);
+  pinMode(IN2_PIN, OUTPUT);
+
+  // PWM for motor speed
+  ledcAttach(ENA_PIN, 1000, 8);
+
+  stopMotor();
+
+  Serial.println("L298N motor test started");
+}
+
+void loop() {
+  Serial.println("Motor forward");
+  motorForward(200);
+  delay(3000);
+
+  Serial.println("Motor stopped");
+  stopMotor();
+  delay(1500);
+
+  Serial.println("Motor backward");
+  motorBackward(200);
+  delay(3000);
+
+  Serial.println("Motor stopped");
+  stopMotor();
+  delay(1500);
+}
+
+void motorForward(int speedValue) {
+  speedValue = constrain(speedValue, 0, 255);
+
+  digitalWrite(IN1_PIN, HIGH);
+  digitalWrite(IN2_PIN, LOW);
+  ledcWrite(ENA_PIN, speedValue);
+}
+
+void motorBackward(int speedValue) {
+  speedValue = constrain(speedValue, 0, 255);
+
+  digitalWrite(IN1_PIN, LOW);
+  digitalWrite(IN2_PIN, HIGH);
+  ledcWrite(ENA_PIN, speedValue);
+}
+
+void stopMotor() {
+  digitalWrite(IN1_PIN, LOW);
+  digitalWrite(IN2_PIN, LOW);
+  ledcWrite(ENA_PIN, 0);
+}
