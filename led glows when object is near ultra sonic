@@ -1,0 +1,86 @@
+const int LED_PIN = 4;
+const int TRIG_PIN = 5;
+const int ECHO_PIN = 6;
+
+// Distance range in centimetres
+const float MIN_DISTANCE = 5.0;    // Full brightness
+const float MAX_DISTANCE = 100.0;  // LED off
+
+int currentBrightness = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // ESP32 PWM setup
+  ledcAttach(LED_PIN, 5000, 8);
+
+  ledcWrite(LED_PIN, 0);
+}
+
+void loop() {
+  float distance = getDistance();
+
+  if (distance > 0) {
+    // Restrict the distance to the selected range
+    float limitedDistance = constrain(
+      distance,
+      MIN_DISTANCE,
+      MAX_DISTANCE
+    );
+
+    // Closer object = brighter LED
+    int targetBrightness = map(
+      (int)limitedDistance,
+      (int)MIN_DISTANCE,
+      (int)MAX_DISTANCE,
+      255,
+      0
+    );
+
+    // Smoothly move toward the new brightness
+    if (currentBrightness < targetBrightness) {
+      currentBrightness++;
+    } 
+    else if (currentBrightness > targetBrightness) {
+      currentBrightness--;
+    }
+
+    ledcWrite(LED_PIN, currentBrightness);
+
+    Serial.print("Distance: ");
+    Serial.print(distance);
+    Serial.print(" cm | Brightness: ");
+    Serial.println(currentBrightness);
+  } 
+  else {
+    Serial.println("No object detected");
+  }
+
+  delay(10);
+}
+
+float getDistance() {
+  // Send ultrasonic pulse
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Read echo pulse, with 30 ms timeout
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duration == 0) {
+    return -1;
+  }
+
+  // Convert pulse duration to centimetres
+  float distance = duration * 0.0343 / 2.0;
+
+  return distance;
+}
