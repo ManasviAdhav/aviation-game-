@@ -1,0 +1,140 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SDA_PIN 42
+#define SCL_PIN 41
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &Wire,
+  OLED_RESET
+);
+
+uint8_t oledAddress = 0;
+
+bool devicePresent(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
+void drawFlower(int bloomSize) {
+  display.clearDisplay();
+
+  // Ground
+  display.drawLine(20, 60, 108, 60, SSD1306_WHITE);
+
+  // Stem
+  display.drawLine(64, 58, 64, 34, SSD1306_WHITE);
+  display.drawLine(65, 58, 65, 34, SSD1306_WHITE);
+
+  // Leaves
+  display.fillTriangle(63, 48, 50, 43, 62, 53, SSD1306_WHITE);
+  display.fillTriangle(66, 51, 79, 45, 67, 56, SSD1306_WHITE);
+
+  // Flower centre
+  display.fillCircle(64, 28, 4, SSD1306_WHITE);
+
+  // Animated petals
+  display.fillCircle(64, 28 - bloomSize, bloomSize, SSD1306_WHITE);
+  display.fillCircle(64, 28 + bloomSize, bloomSize, SSD1306_WHITE);
+  display.fillCircle(64 - bloomSize, 28, bloomSize, SSD1306_WHITE);
+  display.fillCircle(64 + bloomSize, 28, bloomSize, SSD1306_WHITE);
+
+  display.display();
+}
+
+void drawHappyFlower() {
+  display.clearDisplay();
+
+  // Ground
+  display.drawLine(20, 60, 108, 60, SSD1306_WHITE);
+
+  // Stem
+  display.drawLine(64, 58, 64, 35, SSD1306_WHITE);
+  display.drawLine(65, 58, 65, 35, SSD1306_WHITE);
+
+  // Leaves
+  display.fillTriangle(63, 48, 49, 42, 62, 53, SSD1306_WHITE);
+  display.fillTriangle(66, 51, 80, 44, 67, 56, SSD1306_WHITE);
+
+  // Petals
+  display.fillCircle(64, 18, 6, SSD1306_WHITE);
+  display.fillCircle(64, 38, 6, SSD1306_WHITE);
+  display.fillCircle(54, 28, 6, SSD1306_WHITE);
+  display.fillCircle(74, 28, 6, SSD1306_WHITE);
+
+  display.fillCircle(57, 21, 6, SSD1306_WHITE);
+  display.fillCircle(71, 21, 6, SSD1306_WHITE);
+  display.fillCircle(57, 35, 6, SSD1306_WHITE);
+  display.fillCircle(71, 35, 6, SSD1306_WHITE);
+
+  // Flower centre
+  display.fillCircle(64, 28, 8, SSD1306_BLACK);
+  display.drawCircle(64, 28, 8, SSD1306_WHITE);
+
+  // Cute eyes
+  display.fillCircle(61, 26, 1, SSD1306_WHITE);
+  display.fillCircle(67, 26, 1, SSD1306_WHITE);
+
+  // Smile
+  display.drawLine(61, 30, 63, 32, SSD1306_WHITE);
+  display.drawLine(63, 32, 65, 32, SSD1306_WHITE);
+  display.drawLine(65, 32, 68, 29, SSD1306_WHITE);
+
+  display.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(SDA_PIN, SCL_PIN, 100000);
+
+  if (devicePresent(0x3C)) {
+    oledAddress = 0x3C;
+  }
+  else if (devicePresent(0x3D)) {
+    oledAddress = 0x3D;
+  }
+  else {
+    Serial.println("OLED not detected!");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, oledAddress)) {
+    Serial.println("OLED initialization failed!");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  display.clearDisplay();
+  display.display();
+}
+
+void loop() {
+  // Flower blooms
+  for (int size = 1; size <= 6; size++) {
+    drawFlower(size);
+    delay(180);
+  }
+
+  // Show happy flower
+  drawHappyFlower();
+  delay(1500);
+
+  // Flower closes
+  for (int size = 6; size >= 1; size--) {
+    drawFlower(size);
+    delay(150);
+  }
+
+  delay(500);
+}
