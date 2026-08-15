@@ -1,0 +1,283 @@
+import time
+from collections import deque
+
+import cv2
+import numpy as np
+import serial
+
+
+# Change this according to Arduino IDE → Tools → Port
+ARDUINO_PORT = "COM5"
+
+BAUD_RATE = 9600
+
+WINDOW_WIDTH = 1000
+WINDOW_HEIGHT = 600
+
+GRAPH_LEFT = 80
+GRAPH_RIGHT = 950
+GRAPH_TOP = 100
+GRAPH_BOTTOM = 500
+
+MAX_POINTS = 200
+
+
+try:
+    arduino = serial.Serial(
+        port=ARDUINO_PORT,
+        baudrate=BAUD_RATE,
+        timeout=0.1
+    )
+
+except serial.SerialException as error:
+    raise SystemExit(
+        f"Could not open {ARDUINO_PORT}\n"
+        f"Close Arduino Serial Monitor and check the COM port.\n"
+        f"Error: {error}"
+    )
+
+
+print("Connecting to Arduino...")
+time.sleep(2)
+
+arduino.reset_input_buffer()
+
+analog_values = deque(maxlen=MAX_POINTS)
+
+current_value = 0
+current_voltage = 0.0
+
+
+def draw_graph(values, analog_value, voltage):
+    canvas = np.zeros(
+        (WINDOW_HEIGHT, WINDOW_WIDTH, 3),
+        dtype=np.uint8
+    )
+
+    # Dark background
+    canvas[:] = (25, 25, 25)
+
+    # Main heading
+    cv2.putText(
+        canvas,
+        "ARDUINO POTENTIOMETER - LIVE GRAPH",
+        (200, 45),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (255, 255, 255),
+        2
+    )
+
+    # Current reading
+    cv2.putText(
+        canvas,
+        f"ADC: {analog_value}",
+        (80, 80),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 0),
+        2
+    )
+
+    cv2.putText(
+        canvas,
+        f"Voltage: {voltage:.2f} V",
+        (700, 80),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
+        2
+    )
+
+    graph_width = GRAPH_RIGHT - GRAPH_LEFT
+    graph_height = GRAPH_BOTTOM - GRAPH_TOP
+
+    # Horizontal grid lines
+    for value in range(0, 1024, 200):
+        y = GRAPH_BOTTOM - int(
+            value / 1023 * graph_height
+        )
+
+        cv2.line(
+            canvas,
+            (GRAPH_LEFT, y),
+            (GRAPH_RIGHT, y),
+            (70, 70, 70),
+            1
+        )
+
+        cv2.putText(
+            canvas,
+            str(value),
+            (20, y + 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (200, 200, 200),
+            1
+        )
+
+    # Top value 1023
+    cv2.putText(
+        canvas,
+        "1023",
+        (20, GRAPH_TOP + 5),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (200, 200, 200),
+        1
+    )
+
+    # Vertical grid lines
+    for i in range(0, MAX_POINTS + 1, 25):
+        x = GRAPH_LEFT + int(
+            i / MAX_POINTS * graph_width
+        )
+
+        cv2.line(
+            canvas,
+            (x, GRAPH_TOP),
+            (x, GRAPH_BOTTOM),
+            (55, 55, 55),
+            1
+        )
+
+    # Graph border
+    cv2.rectangle(
+        canvas,
+        (GRAPH_LEFT, GRAPH_TOP),
+        (GRAPH_RIGHT, GRAPH_BOTTOM),
+        (220, 220, 220),
+        2
+    )
+
+    # Draw live graph
+    if len(values) > 1:
+        points = []
+
+        for index, value in enumerate(values):
+            x = GRAPH_LEFT + int(
+                index / (MAX_POINTS - 1) * graph_width
+            )
+
+            y = GRAPH_BOTTOM - int(
+                value / 1023 * graph_height
+            )
+
+            points.append([x, y])
+
+        points_array = np.array(
+            points,
+            dtype=np.int32
+        )
+
+        cv2.polylines(
+            canvas,
+            [points_array],
+            False,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA
+        )
+
+    # Axis labels
+    cv2.putText(
+        canvas,
+        "Recent samples",
+        (430, 555),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (220, 220, 220),
+        1
+    )
+
+    cv2.putText(
+        canvas,
+        "Press Q to close",
+        (800, 570),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (180, 180, 180),
+        1
+    )
+
+    # Potentiometer level bar
+    bar_left = 80
+    bar_right = 950
+    bar_top = 520
+    bar_bottom = 540
+
+    cv2.rectangle(
+        canvas,
+        (bar_left, bar_top),
+        (bar_right, bar_bottom),
+        (200, 200, 200),
+        1
+    )
+
+    filled_width = int(
+        analog_value / 1023 * (bar_right - bar_left)
+    )
+
+    cv2.rectangle(
+        canvas,
+        (bar_left, bar_top),
+        (bar_left + filled_width, bar_bottom),
+        (0, 200, 255),
+        -1
+    )
+
+    return canvas
+
+
+try:
+    while True:
+        if arduino.in_waiting > 0:
+            serial_text = arduino.readline().decode(
+                "utf-8",
+                errors="ignore"
+            ).strip()
+
+            if serial_text:
+                try:
+                    parts = serial_text.split(",")
+
+                    current_value = int(parts[0])
+                    current_voltage = float(parts[1])
+
+                    analog_values.append(current_value)
+
+                    print(
+                        f"ADC: {current_value} | "
+                        f"Voltage: {current_voltage:.2f} V"
+                    )
+
+                except (ValueError, IndexError):
+                    print("Invalid data:", serial_text)
+
+        graph_image = draw_graph(
+            analog_values,
+            current_value,
+            current_voltage
+        )
+
+        cv2.imshow(
+            "Potentiometer Live Graph",
+            graph_image
+        )
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q"):
+            break
+
+        # Also stop when the OpenCV window is closed
+        if cv2.getWindowProperty(
+            "Potentiometer Live Graph",
+            cv2.WND_PROP_VISIBLE
+        ) < 1:
+            break
+
+finally:
+    arduino.close()
+    cv2.destroyAllWindows()
+    print("Arduino connection closed.")
