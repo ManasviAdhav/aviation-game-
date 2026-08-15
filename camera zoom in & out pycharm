@@ -1,0 +1,625 @@
+import re
+import time
+
+import cv2
+import serial
+
+
+# =========================================================
+# USER SETTINGS
+# =========================================================
+
+ARDUINO_PORT = "COM5"       # Change to your Arduino port
+BAUD_RATE = 9600
+
+CAMERA_INDEX = 0            # Try 1 if camera 0 is incorrect
+
+# Distance at which maximum zoom is applied
+NEAR_DISTANCE_MM = 100
+
+# Distance at which camera returns to normal 1x zoom
+FAR_DISTANCE_MM = 800
+
+# Maximum digital zoom
+MAX_ZOOM = 3.0
+
+# Higher value = quicker but less smooth response
+DISTANCE_SMOOTHING = 0.25
+ZOOM_SMOOTHING = 0.18
+
+WINDOW_NAME = "VL53L0X Interactive Camera Zoom"
+
+
+# =========================================================
+# SERIAL CONNECTION
+# =========================================================
+
+try:
+    arduino = serial.Serial(
+        port=ARDUINO_PORT,
+        baudrate=BAUD_RATE,
+        timeout=0.05
+    )
+
+except serial.SerialException as error:
+    raise SystemExit(
+        f"\nCould not open {ARDUINO_PORT}.\n"
+        f"Close Arduino Serial Monitor and check the COM port.\n\n"
+        f"Error: {error}"
+    )
+
+
+print("Connecting to Arduino...")
+time.sleep(2)
+
+arduino.reset_input_buffer()
+print("Arduino connected.")
+
+
+# =========================================================
+# CAMERA CONNECTION
+# =========================================================
+
+camera = cv2.VideoCapture(CAMERA_INDEX)
+
+if not camera.isOpened():
+    arduino.close()
+
+    raise SystemExit(
+        "\nCould not open the camera.\n"
+        "Try changing CAMERA_INDEX from 0 to 1."
+    )
+
+
+# Optional camera resolution
+camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+
+# =========================================================
+# VARIABLES
+# =========================================================
+
+raw_distance = None
+smooth_distance = None
+
+current_zoom = 1.0
+maximum_zoom = MAX_ZOOM
+
+last_sensor_update = 0.0
+sensor_connected = False
+
+mirror_camera = True
+show_interface = True
+
+
+# =========================================================
+# SERIAL READING
+# =========================================================
+
+def extract_distance(serial_text):
+    """
+    Accepts either:
+
+    Distance: 245 mm | 24.5 cm
+
+    or simply:
+
+    245
+    """
+
+    # Search for a value followed by mm
+    match = re.search(
+        r"(\d+)\s*mm",
+        serial_text,
+        re.IGNORECASE
+    )
+
+    if match:
+        value = int(match.group(1))
+
+    elif serial_text.strip().isdigit():
+        value = int(serial_text.strip())
+
+    else:
+        return None
+
+    # Ignore common invalid/out-of-range readings
+    if value <= 0 or value >= 65000:
+        return None
+
+    return value
+
+
+def read_sensor():
+    """
+    Reads all currently available serial lines
+    and returns the most recent valid distance.
+    """
+
+    newest_distance = None
+
+    while arduino.in_waiting > 0:
+        line = arduino.readline().decode(
+            "utf-8",
+            errors="ignore"
+        ).strip()
+
+        if not line:
+            continue
+
+        detected_distance = extract_distance(line)
+
+        if detected_distance is not None:
+            newest_distance = detected_distance
+
+    return newest_distance
+
+
+# =========================================================
+# DISTANCE-TO-ZOOM CONVERSION
+# =========================================================
+
+def calculate_target_zoom(distance, max_zoom):
+    """
+    Close object  -> maximum zoom
+    Far object    -> 1x zoom
+    """
+
+    limited_distance = max(
+        NEAR_DISTANCE_MM,
+        min(distance, FAR_DISTANCE_MM)
+    )
+
+    distance_range = (
+        FAR_DISTANCE_MM - NEAR_DISTANCE_MM
+    )
+
+    if distance_range <= 0:
+        return 1.0
+
+    closeness = (
+        FAR_DISTANCE_MM - limited_distance
+    ) / distance_range
+
+    zoom = 1.0 + closeness * (max_zoom - 1.0)
+
+    return zoom
+
+
+# =========================================================
+# DIGITAL CAMERA ZOOM
+# =========================================================
+
+def apply_digital_zoom(frame, zoom):
+    """
+    Crops the centre of the image and resizes it
+    back to the original dimensions.
+    """
+
+    frame_height, frame_width = frame.shape[:2]
+
+    zoom = max(1.0, zoom)
+
+    crop_width = int(frame_width / zoom)
+    crop_height = int(frame_height / zoom)
+
+    centre_x = frame_width // 2
+    centre_y = frame_height // 2
+
+    x1 = centre_x - crop_width // 2
+    y1 = centre_y - crop_height // 2
+
+    x2 = x1 + crop_width
+    y2 = y1 + crop_height
+
+    # Keep crop safely inside the frame
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+
+    x2 = min(frame_width, x2)
+    y2 = min(frame_height, y2)
+
+    cropped_frame = frame[y1:y2, x1:x2]
+
+    if cropped_frame.size == 0:
+        return frame
+
+    zoomed_frame = cv2.resize(
+        cropped_frame,
+        (frame_width, frame_height),
+        interpolation=cv2.INTER_LINEAR
+    )
+
+    return zoomed_frame
+
+
+# =========================================================
+# USER INTERFACE
+# =========================================================
+
+def draw_interface(
+    frame,
+    distance,
+    zoom,
+    max_zoom,
+    sensor_status
+):
+    frame_height, frame_width = frame.shape[:2]
+
+    overlay = frame.copy()
+
+    # Top translucent information panel
+    cv2.rectangle(
+        overlay,
+        (15, 15),
+        (frame_width - 15, 170),
+        (20, 20, 20),
+        -1
+    )
+
+    cv2.addWeighted(
+        overlay,
+        0.72,
+        frame,
+        0.28,
+        0,
+        frame
+    )
+
+    # Heading
+    cv2.putText(
+        frame,
+        "VL53L0X INTERACTIVE CAMERA",
+        (35, 52),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.85,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA
+    )
+
+    # Connection indicator
+    if sensor_status:
+        status_text = "SENSOR CONNECTED"
+        status_colour = (80, 255, 80)
+    else:
+        status_text = "WAITING FOR SENSOR"
+        status_colour = (0, 180, 255)
+
+    cv2.putText(
+        frame,
+        status_text,
+        (frame_width - 310, 50),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        status_colour,
+        2,
+        cv2.LINE_AA
+    )
+
+    # Distance and zoom information
+    if distance is not None:
+        distance_text = f"Distance: {distance:.0f} mm"
+        centimetre_text = f"{distance / 10.0:.1f} cm"
+    else:
+        distance_text = "Distance: -- mm"
+        centimetre_text = "-- cm"
+
+    cv2.putText(
+        frame,
+        distance_text,
+        (35, 95),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA
+    )
+
+    cv2.putText(
+        frame,
+        centimetre_text,
+        (35, 130),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        (220, 220, 220),
+        1,
+        cv2.LINE_AA
+    )
+
+    cv2.putText(
+        frame,
+        f"Zoom: {zoom:.2f}x",
+        (frame_width - 260, 100),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (80, 255, 80),
+        2,
+        cv2.LINE_AA
+    )
+
+    cv2.putText(
+        frame,
+        f"Maximum: {max_zoom:.1f}x",
+        (frame_width - 260, 132),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (210, 210, 210),
+        1,
+        cv2.LINE_AA
+    )
+
+    # Distance bar
+    bar_left = 270
+    bar_right = frame_width - 320
+    bar_top = 105
+    bar_bottom = 128
+
+    if bar_right > bar_left:
+        cv2.rectangle(
+            frame,
+            (bar_left, bar_top),
+            (bar_right, bar_bottom),
+            (220, 220, 220),
+            2
+        )
+
+        if distance is not None:
+            limited_distance = max(
+                NEAR_DISTANCE_MM,
+                min(distance, FAR_DISTANCE_MM)
+            )
+
+            percentage = (
+                limited_distance - NEAR_DISTANCE_MM
+            ) / (
+                FAR_DISTANCE_MM - NEAR_DISTANCE_MM
+            )
+
+            indicator_x = int(
+                bar_left
+                + percentage * (bar_right - bar_left)
+            )
+
+            cv2.circle(
+                frame,
+                (indicator_x, (bar_top + bar_bottom) // 2),
+                9,
+                (0, 255, 255),
+                -1,
+                cv2.LINE_AA
+            )
+
+        cv2.putText(
+            frame,
+            "NEAR",
+            (bar_left, bar_top - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA
+        )
+
+        cv2.putText(
+            frame,
+            "FAR",
+            (bar_right - 25, bar_top - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA
+        )
+
+    # Centre targeting crosshair
+    centre_x = frame_width // 2
+    centre_y = frame_height // 2
+
+    cv2.circle(
+        frame,
+        (centre_x, centre_y),
+        18,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA
+    )
+
+    cv2.line(
+        frame,
+        (centre_x - 30, centre_y),
+        (centre_x - 10, centre_y),
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA
+    )
+
+    cv2.line(
+        frame,
+        (centre_x + 10, centre_y),
+        (centre_x + 30, centre_y),
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA
+    )
+
+    cv2.line(
+        frame,
+        (centre_x, centre_y - 30),
+        (centre_x, centre_y - 10),
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA
+    )
+
+    cv2.line(
+        frame,
+        (centre_x, centre_y + 10),
+        (centre_x, centre_y + 30),
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA
+    )
+
+    # Bottom control panel
+    bottom_overlay = frame.copy()
+
+    cv2.rectangle(
+        bottom_overlay,
+        (15, frame_height - 60),
+        (frame_width - 15, frame_height - 15),
+        (20, 20, 20),
+        -1
+    )
+
+    cv2.addWeighted(
+        bottom_overlay,
+        0.7,
+        frame,
+        0.3,
+        0,
+        frame
+    )
+
+    cv2.putText(
+        frame,
+        "Q: Quit    M: Mirror    H: Hide UI    + / -: Change maximum zoom",
+        (35, frame_height - 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        (235, 235, 235),
+        1,
+        cv2.LINE_AA
+    )
+
+
+# =========================================================
+# OPEN WINDOW
+# =========================================================
+
+cv2.namedWindow(
+    WINDOW_NAME,
+    cv2.WINDOW_NORMAL
+)
+
+cv2.resizeWindow(
+    WINDOW_NAME,
+    1100,
+    700
+)
+
+
+# =========================================================
+# MAIN LOOP
+# =========================================================
+
+try:
+    while True:
+        # Read the VL53L0X
+        new_distance = read_sensor()
+
+        if new_distance is not None:
+            raw_distance = new_distance
+            last_sensor_update = time.time()
+            sensor_connected = True
+
+            if smooth_distance is None:
+                smooth_distance = float(raw_distance)
+
+            else:
+                smooth_distance = (
+                    smooth_distance
+                    * (1.0 - DISTANCE_SMOOTHING)
+                    + raw_distance
+                    * DISTANCE_SMOOTHING
+                )
+
+        # Mark connection as lost when no reading arrives
+        if time.time() - last_sensor_update > 2.0:
+            sensor_connected = False
+
+        # Calculate zoom using the measured distance
+        if smooth_distance is not None and sensor_connected:
+            target_zoom = calculate_target_zoom(
+                smooth_distance,
+                maximum_zoom
+            )
+        else:
+            target_zoom = 1.0
+
+        # Smooth zoom movement
+        current_zoom = (
+            current_zoom * (1.0 - ZOOM_SMOOTHING)
+            + target_zoom * ZOOM_SMOOTHING
+        )
+
+        # Read camera frame
+        success, frame = camera.read()
+
+        if not success:
+            print("Could not read camera frame.")
+            break
+
+        if mirror_camera:
+            frame = cv2.flip(frame, 1)
+
+        # Apply distance-controlled zoom
+        frame = apply_digital_zoom(
+            frame,
+            current_zoom
+        )
+
+        if show_interface:
+            draw_interface(
+                frame,
+                smooth_distance,
+                current_zoom,
+                maximum_zoom,
+                sensor_connected
+            )
+
+        cv2.imshow(WINDOW_NAME, frame)
+
+        key = cv2.waitKey(1) & 0xFF
+
+        # Quit
+        if key == ord("q"):
+            break
+
+        # Mirror/unmirror camera
+        elif key == ord("m"):
+            mirror_camera = not mirror_camera
+
+        # Show/hide interface
+        elif key == ord("h"):
+            show_interface = not show_interface
+
+        # Increase maximum zoom
+        elif key in (ord("+"), ord("=")):
+            maximum_zoom = min(
+                5.0,
+                maximum_zoom + 0.2
+            )
+
+        # Decrease maximum zoom
+        elif key in (ord("-"), ord("_")):
+            maximum_zoom = max(
+                1.2,
+                maximum_zoom - 0.2
+            )
+
+        # Stop when window X is clicked
+        if cv2.getWindowProperty(
+            WINDOW_NAME,
+            cv2.WND_PROP_VISIBLE
+        ) < 1:
+            break
+
+
+finally:
+    camera.release()
+    arduino.close()
+    cv2.destroyAllWindows()
+
+    print("Camera and Arduino connections closed.")
