@@ -1,0 +1,136 @@
+import time
+import cv2
+import serial
+
+# Change this to your Arduino port
+ARDUINO_PORT = "COM5"
+BAUD_RATE = 9600
+
+
+def main():
+    arduino = None
+    camera = None
+
+    try:
+        # Connect to Arduino
+        arduino = serial.Serial(
+            port=ARDUINO_PORT,
+            baudrate=BAUD_RATE,
+            timeout=1
+        )
+
+        # Arduino Uno resets when the serial connection opens
+        time.sleep(2)
+
+        # Load OpenCV's built-in face detector
+        cascade_path = (
+            cv2.data.haarcascades
+            + "haarcascade_frontalface_default.xml"
+        )
+
+        face_detector = cv2.CascadeClassifier(cascade_path)
+
+        if face_detector.empty():
+            raise RuntimeError("Could not load the face detector.")
+
+        # Start laptop webcam
+        camera = cv2.VideoCapture(0)
+
+        if not camera.isOpened():
+            raise RuntimeError("Could not open the webcam.")
+
+        last_led_state = None
+
+        print("Face detection started.")
+        print("Press Q to stop.")
+
+        while True:
+            success, frame = camera.read()
+
+            if not success:
+                print("Could not read webcam frame.")
+                break
+
+            # Convert image to grayscale
+            gray_frame = cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2GRAY
+            )
+
+            # Detect faces
+            faces = face_detector.detectMultiScale(
+                gray_frame,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(80, 80)
+            )
+
+            face_detected = len(faces) > 0
+
+            # Send data only when the LED state changes
+            if face_detected != last_led_state:
+                if face_detected:
+                    arduino.write(b"1")
+                    print("Face detected: LED ON")
+                else:
+                    arduino.write(b"0")
+                    print("No face: LED OFF")
+
+                last_led_state = face_detected
+
+            # Draw rectangles around detected faces
+            for x, y, width, height in faces:
+                cv2.rectangle(
+                    frame,
+                    (x, y),
+                    (x + width, y + height),
+                    (0, 255, 0),
+                    2
+                )
+
+            # Show detection status
+            if face_detected:
+                status = "FACE DETECTED - LED ON"
+                text_colour = (0, 255, 0)
+            else:
+                status = "NO FACE - LED OFF"
+                text_colour = (0, 0, 255)
+
+            cv2.putText(
+                frame,
+                status,
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                text_colour,
+                2
+            )
+
+            cv2.imshow("Arduino Face Detection", frame)
+
+            # Press Q to close
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+    except serial.SerialException as error:
+        print(f"Arduino connection error: {error}")
+        print("Check the COM port and close Arduino Serial Monitor.")
+
+    except Exception as error:
+        print(f"Error: {error}")
+
+    finally:
+        # Switch off LED before closing
+        if arduino is not None and arduino.is_open:
+            arduino.write(b"0")
+            time.sleep(0.1)
+            arduino.close()
+
+        if camera is not None:
+            camera.release()
+
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
