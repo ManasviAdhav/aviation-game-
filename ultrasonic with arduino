@@ -1,0 +1,46 @@
+// HC-SR04 Ultrasonic Sensor
+// VCC  -> 5V
+// GND  -> GND
+// TRIG -> Pin 5
+// ECHO -> Pin 4
+
+const int TRIG_PIN = 5;
+const int ECHO_PIN = 4;
+
+long duration;
+float distanceCm;
+
+void setup() {
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  Serial.begin(9600);
+  Serial.println("HC-SR04 Ultrasonic Sensor");
+}
+
+void loop() {
+  // Clear the trigger pin
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  // Send a 10-microsecond pulse
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Measure the echo pulse duration
+  duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duration == 0) {
+    Serial.println("No object detected");
+  } else {
+    // Convert duration to distance
+    distanceCm = duration * 0.0343 / 2;
+
+    Serial.print("Distance: ");
+    Serial.print(distanceCm);
+    Serial.println(" cm");
+  }
+
+  delay(300);
+}
