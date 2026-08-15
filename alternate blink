@@ -1,0 +1,19 @@
+const int ledPin1 = 12;
+const int ledPin2 = 13;
+
+void setup() {
+  pinMode(ledPin1, OUTPUT);
+  pinMode(ledPin2, OUTPUT);
+}
+
+void loop() {
+  // LED 1 ON, LED 2 OFF
+  digitalWrite(ledPin1, HIGH);
+  digitalWrite(ledPin2, LOW);
+  delay(3000);
+
+  // LED 1 OFF, LED 2 ON
+  digitalWrite(ledPin1, LOW);
+  digitalWrite(ledPin2, HIGH);
+  delay(3000);
+}
