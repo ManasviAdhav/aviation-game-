@@ -1,0 +1,112 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT11.h>
+
+const int dhtPin = 8;
+const int buzzerPin = 7;
+
+// Common-anode RGB LED pins
+const int redPin = 10;
+const int greenPin = 11;
+const int bluePin = 12;
+
+DHT11 dht11(dhtPin);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(buzzerPin, OUTPUT);
+
+  pinMode(redPin, OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  pinMode(bluePin, OUTPUT);
+
+  noTone(buzzerPin);
+  rgbOff();
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.setCursor(0, 0);
+  lcd.print("System Starting");
+  delay(2000);
+
+  lcd.clear();
+}
+
+void loop() {
+  int temperature = 0;
+  int humidity = 0;
+
+  int result =
+    dht11.readTemperatureHumidity(temperature, humidity);
+
+  if (result == 0) {
+    Serial.print("Temperature: ");
+    Serial.print(temperature);
+    Serial.print(" C, Humidity: ");
+    Serial.print(humidity);
+    Serial.println(" %");
+
+    lcd.setCursor(0, 0);
+    lcd.print("Temp:");
+    lcd.print(temperature);
+    lcd.print((char)223);
+    lcd.print("C       ");
+
+    lcd.setCursor(0, 1);
+    lcd.print("Humidity:");
+    lcd.print(humidity);
+    lcd.print("%   ");
+
+    // Buzzer sounds above 80% humidity
+    if (humidity > 80) {
+      tone(buzzerPin, 1000);
+    } else {
+      noTone(buzzerPin);
+    }
+
+    // RGB LED colour control
+    if (humidity > 90) {
+      showRed();
+    } else {
+      showGreen();
+    }
+  }
+  else {
+    noTone(buzzerPin);
+    rgbOff();
+
+    lcd.setCursor(0, 0);
+    lcd.print("Sensor Error!   ");
+
+    lcd.setCursor(0, 1);
+    lcd.print("Check Wiring    ");
+
+    Serial.print("DHT11 error: ");
+    Serial.println(DHT11::getErrorString(result));
+  }
+
+  delay(2000);
+}
+
+// Common-anode RGB LED uses LOW to turn a colour ON
+
+void showRed() {
+  digitalWrite(redPin, LOW);
+  digitalWrite(greenPin, HIGH);
+  digitalWrite(bluePin, HIGH);
+}
+
+void showGreen() {
+  digitalWrite(redPin, HIGH);
+  digitalWrite(greenPin, LOW);
+  digitalWrite(bluePin, HIGH);
+}
+
+void rgbOff() {
+  digitalWrite(redPin, HIGH);
+  digitalWrite(greenPin, HIGH);
+  digitalWrite(bluePin, HIGH);
+}
