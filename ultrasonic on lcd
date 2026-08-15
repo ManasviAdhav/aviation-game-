@@ -1,0 +1,70 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// LCD address is usually 0x27
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+const int TRIG_PIN = 5;
+const int ECHO_PIN = 4;
+
+long duration;
+float distanceCm;
+
+void setup() {
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  Serial.begin(9600);
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Ultrasonic");
+  lcd.setCursor(0, 1);
+  lcd.print("Sensor Ready");
+
+  delay(2000);
+  lcd.clear();
+}
+
+void loop() {
+  // Send trigger pulse
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Read echo pulse
+  duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  lcd.clear();
+
+  if (duration == 0) {
+    Serial.println("No object detected");
+
+    lcd.setCursor(0, 0);
+    lcd.print("Distance:");
+    lcd.setCursor(0, 1);
+    lcd.print("No Object");
+  } 
+  else {
+    distanceCm = duration * 0.0343 / 2;
+
+    Serial.print("Distance: ");
+    Serial.print(distanceCm);
+    Serial.println(" cm");
+
+    lcd.setCursor(0, 0);
+    lcd.print("Distance:");
+
+    lcd.setCursor(0, 1);
+    lcd.print(distanceCm, 1);
+    lcd.print(" cm");
+  }
+
+  delay(500);
+}
