@@ -1,0 +1,173 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// OLED pins
+#define SDA_PIN 42
+#define SCL_PIN 41
+
+// Ultrasonic sensor pins
+#define TRIG_PIN 5
+#define ECHO_PIN 6
+
+// LED pin
+#define LED_PIN 4
+
+// OLED settings
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &Wire,
+  OLED_RESET
+);
+
+// Distance limits
+const float MIN_DISTANCE = 5.0;    // LED fully bright
+const float MAX_DISTANCE = 100.0;  // LED off
+
+uint8_t oledAddress = 0;
+int smoothBrightness = 0;
+
+
+// Check whether an I2C device is present
+bool devicePresent(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
+
+// Measure distance in centimetres
+float getDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duration == 0) {
+    return -1;
+  }
+
+  return duration * 0.0343 / 2.0;
+}
+
+
+// Show distance and LED brightness on OLED
+void showDistance(float distance, int brightness) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(24, 4);
+  display.println("DISTANCE");
+
+  display.drawLine(10, 16, 118, 16, SSD1306_WHITE);
+
+  display.setTextSize(2);
+
+  if (distance < 0) {
+    display.setCursor(20, 27);
+    display.println("NO OBJECT");
+  } else {
+    display.setCursor(25, 25);
+    display.print(distance, 1);
+    display.print(" cm");
+
+    // Brightness bar
+    int barWidth = map(brightness, 0, 255, 0, 108);
+
+    display.drawRect(10, 51, 108, 10, SSD1306_WHITE);
+    display.fillRect(10, 51, barWidth, 10, SSD1306_WHITE);
+  }
+
+  display.display();
+}
+
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // Start PWM for LED
+  ledcAttach(LED_PIN, 5000, 8);
+  ledcWrite(LED_PIN, 0);
+
+  // Start OLED
+  Wire.begin(SDA_PIN, SCL_PIN, 100000);
+
+  // Detect OLED address
+  if (devicePresent(0x3C)) {
+    oledAddress = 0x3C;
+  } else if (devicePresent(0x3D)) {
+    oledAddress = 0x3D;
+  } else {
+    Serial.println("OLED not detected!");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, oledAddress)) {
+    Serial.println("OLED initialization failed!");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  display.clearDisplay();
+  display.display();
+}
+
+
+void loop() {
+  float distance = getDistance();
+
+  int targetBrightness = 0;
+
+  if (distance > 0) {
+    float limitedDistance = constrain(
+      distance,
+      MIN_DISTANCE,
+      MAX_DISTANCE
+    );
+
+    // Closer object = brighter LED
+    targetBrightness = map(
+      (int)limitedDistance,
+      (int)MIN_DISTANCE,
+      (int)MAX_DISTANCE,
+      255,
+      0
+    );
+
+    Serial.print("Distance: ");
+    Serial.print(distance);
+    Serial.print(" cm | Brightness: ");
+    Serial.println(targetBrightness);
+  } else {
+    targetBrightness = 0;
+    Serial.println("No object detected");
+  }
+
+  // Smooth LED brightness change
+  smoothBrightness =
+    (smoothBrightness * 4 + targetBrightness) / 5;
+
+  ledcWrite(LED_PIN, smoothBrightness);
+
+  showDistance(distance, smoothBrightness);
+
+  delay(80);
+}
