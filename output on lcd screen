@@ -1,0 +1,75 @@
+#include <Wire.h>
+#include <Adafruit_LiquidCrystal.h>
+
+// Adafruit I2C LCD backpack, default address setting
+Adafruit_LiquidCrystal lcd(0);
+
+const int TRIG_PIN = 5;
+const int ECHO_PIN = 4;
+
+long duration;
+float distanceCm;
+
+void setup() {
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  Serial.begin(9600);
+
+  // Start the 16x2 LCD
+  if (!lcd.begin(16, 2)) {
+    Serial.println("LCD not detected. Check wiring.");
+    while (1);
+  }
+
+  lcd.setBacklight(HIGH);
+
+  lcd.setCursor(0, 0);
+  lcd.print("Ultrasonic");
+  lcd.setCursor(0, 1);
+  lcd.print("Sensor Ready");
+
+  delay(2000);
+  lcd.clear();
+}
+
+void loop() {
+  // Send ultrasonic trigger pulse
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Measure echo pulse
+  duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duration == 0) {
+    Serial.println("Hi Poorvi");
+
+    lcd.setCursor(0, 0);
+    lcd.print("Distance:       ");
+
+    lcd.setCursor(0, 1);
+    lcd.print("No object       ");
+  } else {
+    distanceCm = duration * 0.0343 / 2.0;
+
+    Serial.print("Distance: ");
+    Serial.print(distanceCm, 1);
+    Serial.println(" cm");
+
+    lcd.setCursor(0, 0);
+    lcd.print("Distance:       ");
+
+    lcd.setCursor(0, 1);
+    lcd.print(distanceCm, 1);
+    lcd.print(" cm           ");
+  }
+
+  delay(300);
+}
