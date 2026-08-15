@@ -1,0 +1,95 @@
+#include <Wire.h>
+#include <U8g2lib.h>
+
+// For a 0.96-inch 128x64 I2C SSD1306 OLED
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(
+  U8G2_R0,
+  U8X8_PIN_NONE
+);
+
+int carX = -45;
+int roadOffset = 0;
+
+void drawCar(int x, int y) {
+  // Main body
+  display.drawRBox(x, y + 9, 42, 13, 3);
+
+  // Roof
+  display.drawBox(x + 10, y + 3, 22, 9);
+
+  // Windows
+  display.setDrawColor(0);
+  display.drawBox(x + 13, y + 5, 7, 5);
+  display.drawBox(x + 23, y + 5, 7, 5);
+
+  // Headlight
+  display.drawBox(x + 39, y + 12, 3, 3);
+
+  display.setDrawColor(1);
+
+  // Wheels
+  display.drawDisc(x + 10, y + 22, 5);
+  display.drawDisc(x + 32, y + 22, 5);
+
+  // Wheel centres
+  display.setDrawColor(0);
+  display.drawDisc(x + 10, y + 22, 2);
+  display.drawDisc(x + 32, y + 22, 2);
+
+  display.setDrawColor(1);
+}
+
+void setup() {
+  display.begin();
+
+  // Starting message
+  display.clearBuffer();
+  display.setFont(u8g2_font_6x12_tf);
+  display.drawStr(25, 25, "CAR STARTING");
+  display.drawStr(39, 42, "READY!");
+  display.sendBuffer();
+
+  delay(1500);
+}
+
+void loop() {
+  display.clearBuffer();
+
+  // Sun
+  display.drawCircle(110, 10, 6);
+  display.drawLine(110, 0, 110, 2);
+  display.drawLine(110, 18, 110, 21);
+  display.drawLine(100, 10, 102, 10);
+  display.drawLine(118, 10, 121, 10);
+
+  // Ground and road
+  display.drawLine(0, 57, 127, 57);
+  display.drawLine(0, 63, 127, 63);
+
+  // Moving road markings
+  for (int x = -roadOffset; x < 128; x += 24) {
+    display.drawLine(x, 60, x + 10, 60);
+  }
+
+  // Draw the moving car
+  drawCar(carX, 30);
+
+  display.sendBuffer();
+
+  // Move the car
+  carX += 2;
+
+  // Move road markings in the opposite direction
+  roadOffset += 2;
+
+  if (roadOffset >= 24) {
+    roadOffset = 0;
+  }
+
+  // Restart car after it leaves the screen
+  if (carX > 128) {
+    carX = -45;
+  }
+
+  delay(40);
+}
