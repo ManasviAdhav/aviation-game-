@@ -1,0 +1,19 @@
+const int potentiometerPin = A0;
+
+void setup() {
+  Serial.begin(9600);
+}
+
+void loop() {
+  int sensorValue = analogRead(potentiometerPin);
+
+  // Convert the ADC value into voltage
+  float voltage = sensorValue * (5.0 / 1023.0);
+
+  // Send both values to Python
+  Serial.print(sensorValue);
+  Serial.print(",");
+  Serial.println(voltage, 2);
+
+  delay(50);
+}
