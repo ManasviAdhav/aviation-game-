@@ -1,0 +1,16 @@
+const int potentiometerPin = A0;
+
+void setup() {
+  Serial.begin(9600);
+}
+
+void loop() {
+  int analogValue = analogRead(potentiometerPin);
+  float voltage = analogValue * (5.0 / 1023.0);
+
+  Serial.print(analogValue);
+  Serial.print(",");
+  Serial.println(voltage, 2);
+
+  delay(40);
+}
