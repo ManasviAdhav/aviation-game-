@@ -1,0 +1,32 @@
+const int LED_PIN = 3;
+const int BUTTON_PIN = 5;
+
+bool ledState = false;
+bool previousButtonState = HIGH;
+
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50;
+
+void setup() {
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  digitalWrite(LED_PIN, LOW);
+}
+
+void loop() {
+  bool currentButtonState = digitalRead(BUTTON_PIN);
+
+  // Detect when the button is pressed
+  if (currentButtonState == LOW &&
+      previousButtonState == HIGH &&
+      millis() - lastDebounceTime > debounceDelay) {
+
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState);
+
+    lastDebounceTime = millis();
+  }
+
+  previousButtonState = currentButtonState;
+}
