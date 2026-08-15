@@ -1,0 +1,75 @@
+const int redPin = 7;
+const int greenPin = 8;
+const int bluePin = 9;
+
+void setup() {
+  pinMode(redPin, OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  pinMode(bluePin, OUTPUT);
+
+  turnOff();
+}
+
+void loop() {
+  red();
+  delay(1000);
+
+  green();
+  delay(1000);
+
+  blue();
+  delay(1000);
+
+  yellow();
+  delay(1000);
+
+  cyan();
+  delay(1000);
+
+  violet();
+  delay(1000);
+
+  white();
+  delay(1000);
+
+  turnOff();
+  delay(1000);
+}
+
+void red() {
+  setColor(LOW, HIGH, HIGH);
+}
+
+void green() {
+  setColor(HIGH, LOW, HIGH);
+}
+
+void blue() {
+  setColor(HIGH, HIGH, LOW);
+}
+
+void yellow() {
+  setColor(LOW, LOW, HIGH);
+}
+
+void cyan() {
+  setColor(HIGH, LOW, LOW);
+}
+
+void violet() {
+  setColor(LOW, HIGH, LOW);  // Red + Blue
+}
+
+void white() {
+  setColor(LOW, LOW, LOW);   // All colours ON
+}
+
+void turnOff() {
+  setColor(HIGH, HIGH, HIGH);
+}
+
+void setColor(int redValue, int greenValue, int blueValue) {
+  digitalWrite(redPin, redValue);
+  digitalWrite(greenPin, greenValue);
+  digitalWrite(bluePin, blueValue);
+}
