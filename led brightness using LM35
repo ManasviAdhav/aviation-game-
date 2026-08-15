@@ -1,0 +1,26 @@
+const int sensorPin = A0;
+const int ledPin = 11;
+
+void setup() {
+  pinMode(ledPin, OUTPUT);
+  Serial.begin(9600);
+}
+
+void loop() {
+  int sensorValue = analogRead(sensorPin);
+
+  float voltage = sensorValue * (5.0 / 1023.0);
+  float temperatureC = voltage * 100.0;  // LM35 calculation
+
+  Serial.print("Temperature: ");
+  Serial.print(temperatureC);
+  Serial.println(" C");
+
+  if (temperatureC > 24.0) {
+    digitalWrite(ledPin, HIGH);  // LED ON above 24°C
+  } else {
+    digitalWrite(ledPin, LOW);   // LED OFF at or below 24°C
+  }
+
+  delay(500);
+}
