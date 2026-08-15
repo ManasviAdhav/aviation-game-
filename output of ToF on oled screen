@@ -1,0 +1,228 @@
+#include <Wire.h>
+#include <VL53L0X.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// OLED pins
+#define OLED_SDA_PIN 41
+#define OLED_SCL_PIN 42
+
+// ToF sensor pins
+#define TOF_SDA_PIN 6
+#define TOF_SCL_PIN 5
+
+// LED pin
+#define LED_PIN 4
+
+// OLED configuration
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+// LED distance settings
+#define LED_ON_DISTANCE_MM  200  // LED ON at 20 cm or nearer
+#define LED_OFF_DISTANCE_MM 230  // LED OFF at 23 cm or farther
+
+// Separate I2C buses
+TwoWire OLEDWire = TwoWire(0);
+TwoWire TOFWire  = TwoWire(1);
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &OLEDWire,
+  OLED_RESET
+);
+
+VL53L0X tofSensor;
+
+uint8_t oledAddress = 0;
+bool ledState = false;
+
+
+// Check whether an I2C device is connected
+bool devicePresent(TwoWire &bus, uint8_t address) {
+  bus.beginTransmission(address);
+  return bus.endTransmission() == 0;
+}
+
+
+// Display a message
+void showMessage(const char *message) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(15, 27);
+  display.println(message);
+  display.display();
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // OLED: SDA 41, SCL 42
+  OLEDWire.begin(
+    OLED_SDA_PIN,
+    OLED_SCL_PIN,
+    100000
+  );
+
+  // ToF: SDA 6, SCL 5
+  TOFWire.begin(
+    TOF_SDA_PIN,
+    TOF_SCL_PIN,
+    100000
+  );
+
+  delay(500);
+
+  // Detect OLED address
+  if (devicePresent(OLEDWire, 0x3C)) {
+    oledAddress = 0x3C;
+  }
+  else if (devicePresent(OLEDWire, 0x3D)) {
+    oledAddress = 0x3D;
+  }
+  else {
+    Serial.println("ERROR: OLED not detected!");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  // Start OLED without restarting the custom I2C bus
+  if (!display.begin(
+        SSD1306_SWITCHCAPVCC,
+        oledAddress,
+        true,
+        false
+      )) {
+    Serial.println("ERROR: OLED initialization failed!");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  showMessage("Starting ToF...");
+
+  // Check ToF address
+  if (!devicePresent(TOFWire, 0x29)) {
+    Serial.println("ERROR: ToF not detected at 0x29");
+    showMessage("CHECK TOF WIRING");
+
+    while (true) {
+      digitalWrite(LED_PIN, LOW);
+      delay(1000);
+    }
+  }
+
+  // Start VL53L0X on the second I2C bus
+  tofSensor.setBus(&TOFWire);
+  tofSensor.setTimeout(500);
+
+  if (!tofSensor.init()) {
+    Serial.println("ERROR: VL53L0X initialization failed!");
+    showMessage("TOF INIT ERROR");
+
+    while (true) {
+      digitalWrite(LED_PIN, LOW);
+      delay(1000);
+    }
+  }
+
+  // Continuous measurement every 50 milliseconds
+  tofSensor.startContinuous(50);
+
+  Serial.println("OLED and VL53L0X ready!");
+  showMessage("SENSOR READY");
+
+  delay(1000);
+}
+
+
+void loop() {
+  uint16_t distanceMM =
+    tofSensor.readRangeContinuousMillimeters();
+
+  bool validReading =
+    !tofSensor.timeoutOccurred() &&
+    distanceMM > 0 &&
+    distanceMM < 2000;
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(22, 2);
+  display.println("TOF DISTANCE");
+
+  display.drawLine(
+    8,
+    15,
+    120,
+    15,
+    SSD1306_WHITE
+  );
+
+  if (validReading) {
+    float distanceCM = distanceMM / 10.0;
+
+    // Turn LED ON when object is close
+    if (distanceMM <= LED_ON_DISTANCE_MM) {
+      ledState = true;
+    }
+
+    // Turn LED OFF when object is far
+    else if (distanceMM >= LED_OFF_DISTANCE_MM) {
+      ledState = false;
+    }
+
+    digitalWrite(
+      LED_PIN,
+      ledState ? HIGH : LOW
+    );
+
+    // Display distance
+    display.setTextSize(2);
+    display.setCursor(18, 22);
+    display.print(distanceCM, 1);
+    display.print(" cm");
+
+    // Display LED status
+    display.setTextSize(1);
+    display.setCursor(40, 51);
+
+    if (ledState) {
+      display.println("LED ON");
+    }
+    else {
+      display.println("LED OFF");
+    }
+
+    // Serial Monitor output
+    Serial.print("Distance: ");
+    Serial.print(distanceCM, 1);
+    Serial.print(" cm | LED: ");
+    Serial.println(ledState ? "ON" : "OFF");
+  }
+  else {
+    ledState = false;
+    digitalWrite(LED_PIN, LOW);
+
+    display.setTextSize(1);
+    display.setCursor(27, 27);
+    display.println("NO READING");
+
+    Serial.println("Invalid reading | LED: OFF");
+  }
+
+  display.display();
+  delay(100);
+}
