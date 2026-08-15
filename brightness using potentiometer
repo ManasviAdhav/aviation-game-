@@ -1,0 +1,19 @@
+const int potentiometerPin = A0;
+const int ledPin = 11;
+
+void setup() {
+  pinMode(ledPin, OUTPUT);
+}
+
+void loop() {
+  // Read potentiometer value: 0–1023
+  int potentiometerValue = analogRead(potentiometerPin);
+
+  // Convert it to PWM brightness range: 0–255
+  int ledBrightness = map(potentiometerValue, 0, 1023, 0, 255);
+
+  // Control LED brightness
+  analogWrite(ledPin, ledBrightness);
+
+  delay(10);
+}
