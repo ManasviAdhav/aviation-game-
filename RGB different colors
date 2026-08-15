@@ -1,0 +1,45 @@
+const int redPin = 7;
+const int greenPin = 8;
+const int bluePin = 9;
+
+void setup() {
+  pinMode(redPin, OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  pinMode(bluePin, OUTPUT);
+
+  // Start with LED completely off
+  setColor(false, false, false);
+}
+
+void loop() {
+  setColor(true, false, false);    // Red
+  delay(1000);
+
+  setColor(false, true, false);    // Green
+  delay(1000);
+
+  setColor(false, false, true);    // Blue
+  delay(1000);
+
+  setColor(true, true, false);     // Yellow
+  delay(1000);
+
+  setColor(false, true, true);     // Cyan
+  delay(1000);
+
+  setColor(true, false, true);     // Magenta
+  delay(1000);
+
+  setColor(true, true, true);      // White
+  delay(1000);
+
+  setColor(false, false, false);   // Off
+  delay(1000);
+}
+
+void setColor(bool redOn, bool greenOn, bool blueOn) {
+  // Common-anode LED uses inverted logic
+  digitalWrite(redPin, redOn ? LOW : HIGH);
+  digitalWrite(greenPin, greenOn ? LOW : HIGH);
+  digitalWrite(bluePin, blueOn ? LOW : HIGH);
+}
