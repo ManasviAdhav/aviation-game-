@@ -1,0 +1,28 @@
+const int LED_PIN = 3;
+
+// PWM settings
+const int PWM_FREQUENCY = 5000;
+const int PWM_RESOLUTION = 8;  // Brightness range: 0–255
+
+void setup() {
+  // Attach PWM to the LED pin
+  ledcAttach(LED_PIN, PWM_FREQUENCY, PWM_RESOLUTION);
+}
+
+void loop() {
+  // Smoothly turn LED ON
+  for (int brightness = 0; brightness <= 255; brightness++) {
+    ledcWrite(LED_PIN, brightness);
+    delay(8);
+  }
+
+  delay(300);
+
+  // Smoothly turn LED OFF
+  for (int brightness = 255; brightness >= 0; brightness--) {
+    ledcWrite(LED_PIN, brightness);
+    delay(8);
+  }
+
+  delay(300);
+}
