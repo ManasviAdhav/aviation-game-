@@ -1,0 +1,569 @@
+import random
+import socket
+import time
+from typing import Optional
+
+import cv2
+import numpy as np
+
+
+# =========================================================
+# ESP32-S3 WI-FI SETTINGS
+# =========================================================
+
+ESP32_IP = "192.168.4.1"
+ESP32_PORT = 3333
+
+
+# =========================================================
+# TOF SETTINGS
+# =========================================================
+
+# Start firing when the object is closer than this
+NEAR_DISTANCE_MM = 300
+
+# Stop firing when the object moves beyond this
+FAR_DISTANCE_MM = 360
+
+# Time between shots
+SHOT_INTERVAL_SECONDS = 0.18
+
+
+# =========================================================
+# GAME SETTINGS
+# =========================================================
+
+WINDOW_WIDTH = 1100
+WINDOW_HEIGHT = 700
+
+GUN_X = WINDOW_WIDTH // 2
+GUN_Y = WINDOW_HEIGHT - 65
+
+BULLET_SPEED = 850
+BULLET_RADIUS = 7
+
+NUMBER_OF_TARGETS = 7
+
+
+def create_target():
+    """Create one moving target ball."""
+
+    radius = random.randint(25, 45)
+
+    return {
+        "x": float(random.randint(radius + 20, WINDOW_WIDTH - radius - 20)),
+        "y": float(random.randint(radius + 100, WINDOW_HEIGHT // 2)),
+        "radius": radius,
+        "vx": float(random.choice([-1, 1]) * random.randint(90, 190)),
+        "vy": float(random.choice([-1, 1]) * random.randint(50, 120)),
+        "colour": (
+            random.randint(80, 255),
+            random.randint(80, 255),
+            random.randint(80, 255),
+        ),
+    }
+
+
+def connect_to_esp32() -> socket.socket:
+    """Connect to the ESP32-S3 TCP distance server."""
+
+    print(f"Connecting to ESP32-S3 at {ESP32_IP}:{ESP32_PORT}...")
+
+    connection = socket.create_connection(
+        (ESP32_IP, ESP32_PORT),
+        timeout=3,
+    )
+
+    connection.setblocking(False)
+
+    print("Connected to ESP32-S3 through Wi-Fi.")
+
+    return connection
+
+
+def draw_gun(frame, firing: bool):
+    """Draw the virtual gun at the bottom of the screen."""
+
+    gun_colour = (70, 230, 100) if firing else (160, 160, 170)
+
+    # Gun base
+    cv2.rectangle(
+        frame,
+        (GUN_X - 55, GUN_Y),
+        (GUN_X + 55, GUN_Y + 45),
+        gun_colour,
+        -1,
+    )
+
+    # Gun barrel
+    cv2.rectangle(
+        frame,
+        (GUN_X - 15, GUN_Y - 75),
+        (GUN_X + 15, GUN_Y + 5),
+        gun_colour,
+        -1,
+    )
+
+    # Barrel tip
+    cv2.rectangle(
+        frame,
+        (GUN_X - 22, GUN_Y - 85),
+        (GUN_X + 22, GUN_Y - 70),
+        (50, 50, 60),
+        -1,
+    )
+
+    # Gun wheels
+    cv2.circle(
+        frame,
+        (GUN_X - 40, GUN_Y + 48),
+        16,
+        (45, 45, 52),
+        -1,
+    )
+
+    cv2.circle(
+        frame,
+        (GUN_X + 40, GUN_Y + 48),
+        16,
+        (45, 45, 52),
+        -1,
+    )
+
+
+def draw_interface(
+    frame,
+    distance: Optional[int],
+    firing: bool,
+    connected: bool,
+    score: int,
+):
+    """Draw sensor and game information."""
+
+    cv2.putText(
+        frame,
+        "TOF BALL SHOOTER",
+        (30, 50),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.1,
+        (255, 255, 255),
+        3,
+        cv2.LINE_AA,
+    )
+
+    if connected:
+        connection_text = "ESP32-S3 WI-FI CONNECTED"
+        connection_colour = (70, 230, 100)
+    else:
+        connection_text = "CONNECTING TO ESP32-S3..."
+        connection_colour = (70, 170, 255)
+
+    cv2.putText(
+        frame,
+        connection_text,
+        (30, 82),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        connection_colour,
+        2,
+        cv2.LINE_AA,
+    )
+
+    if distance is None:
+        distance_text = "Distance: --- mm"
+    else:
+        distance_text = f"Distance: {distance} mm"
+
+    cv2.putText(
+        frame,
+        distance_text,
+        (30, 125),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (230, 230, 235),
+        2,
+        cv2.LINE_AA,
+    )
+
+    if firing:
+        firing_text = "OBJECT NEAR - FIRING"
+        firing_colour = (70, 240, 100)
+    else:
+        firing_text = "OBJECT FAR - NOT FIRING"
+        firing_colour = (100, 180, 255)
+
+    cv2.putText(
+        frame,
+        firing_text,
+        (30, 165),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.72,
+        firing_colour,
+        2,
+        cv2.LINE_AA,
+    )
+
+    cv2.putText(
+        frame,
+        f"Score: {score}",
+        (WINDOW_WIDTH - 190, 55),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.85,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    cv2.putText(
+        frame,
+        f"Fire below {NEAR_DISTANCE_MM} mm",
+        (WINDOW_WIDTH - 260, 95),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (190, 195, 205),
+        1,
+        cv2.LINE_AA,
+    )
+
+    cv2.putText(
+        frame,
+        "Q: Exit   R: Reset",
+        (WINDOW_WIDTH - 220, WINDOW_HEIGHT - 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (180, 185, 195),
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def main():
+    connection = None
+    receive_buffer = ""
+
+    current_distance = None
+    last_sensor_update = 0.0
+    last_connection_attempt = 0.0
+    last_shot_time = 0.0
+
+    firing = False
+    score = 0
+
+    bullets = []
+    targets = [create_target() for _ in range(NUMBER_OF_TARGETS)]
+
+    previous_frame_time = time.perf_counter()
+
+    try:
+        while True:
+            current_time = time.time()
+
+            # -------------------------------------------------
+            # CONNECT OR RECONNECT TO ESP32-S3
+            # -------------------------------------------------
+
+            if (
+                connection is None
+                and current_time - last_connection_attempt >= 2
+            ):
+                last_connection_attempt = current_time
+
+                try:
+                    connection = connect_to_esp32()
+                    receive_buffer = ""
+
+                except OSError:
+                    connection = None
+                    print("Waiting for ESP32-S3 Wi-Fi...")
+
+            # -------------------------------------------------
+            # RECEIVE TOF DISTANCE
+            # -------------------------------------------------
+
+            if connection is not None:
+                try:
+                    data = connection.recv(4096)
+
+                    if not data:
+                        raise ConnectionError("ESP32 disconnected")
+
+                    receive_buffer += data.decode(
+                        "utf-8",
+                        errors="ignore",
+                    )
+
+                    while "\n" in receive_buffer:
+                        line, receive_buffer = receive_buffer.split(
+                            "\n",
+                            1,
+                        )
+
+                        line = line.strip()
+
+                        if not line or line == "READY":
+                            continue
+
+                        try:
+                            distance = int(line)
+                        except ValueError:
+                            continue
+
+                        if distance > 0:
+                            current_distance = distance
+                        else:
+                            current_distance = None
+
+                        last_sensor_update = current_time
+
+                except BlockingIOError:
+                    pass
+
+                except (OSError, ConnectionError):
+                    print("ESP32-S3 connection lost.")
+
+                    try:
+                        connection.close()
+                    except OSError:
+                        pass
+
+                    connection = None
+                    current_distance = None
+                    firing = False
+
+            # Stop using an old sensor reading
+            if current_time - last_sensor_update > 1.5:
+                current_distance = None
+                firing = False
+
+            # -------------------------------------------------
+            # DISTANCE HYSTERESIS
+            # -------------------------------------------------
+
+            if current_distance is None:
+                firing = False
+
+            elif not firing and current_distance <= NEAR_DISTANCE_MM:
+                firing = True
+
+            elif firing and current_distance >= FAR_DISTANCE_MM:
+                firing = False
+
+            # -------------------------------------------------
+            # FRAME TIMING
+            # -------------------------------------------------
+
+            now = time.perf_counter()
+            delta_time = min(now - previous_frame_time, 0.05)
+            previous_frame_time = now
+
+            # -------------------------------------------------
+            # AUTOMATIC FIRING
+            # -------------------------------------------------
+
+            if (
+                firing
+                and current_time - last_shot_time
+                >= SHOT_INTERVAL_SECONDS
+            ):
+                bullets.append(
+                    {
+                        "x": float(GUN_X),
+                        "y": float(GUN_Y - 85),
+                    }
+                )
+
+                last_shot_time = current_time
+
+            # -------------------------------------------------
+            # MOVE BULLETS
+            # -------------------------------------------------
+
+            for bullet in bullets:
+                bullet["y"] -= BULLET_SPEED * delta_time
+
+            bullets = [
+                bullet
+                for bullet in bullets
+                if bullet["y"] > -20
+            ]
+
+            # -------------------------------------------------
+            # MOVE TARGET BALLS
+            # -------------------------------------------------
+
+            for target in targets:
+                target["x"] += target["vx"] * delta_time
+                target["y"] += target["vy"] * delta_time
+
+                radius = target["radius"]
+
+                if target["x"] - radius <= 0:
+                    target["x"] = float(radius)
+                    target["vx"] = abs(target["vx"])
+
+                if target["x"] + radius >= WINDOW_WIDTH:
+                    target["x"] = float(WINDOW_WIDTH - radius)
+                    target["vx"] = -abs(target["vx"])
+
+                if target["y"] - radius <= 90:
+                    target["y"] = float(90 + radius)
+                    target["vy"] = abs(target["vy"])
+
+                if target["y"] + radius >= WINDOW_HEIGHT - 180:
+                    target["y"] = float(
+                        WINDOW_HEIGHT - 180 - radius
+                    )
+                    target["vy"] = -abs(target["vy"])
+
+            # -------------------------------------------------
+            # BULLET AND BALL COLLISIONS
+            # -------------------------------------------------
+
+            remaining_bullets = []
+
+            for bullet in bullets:
+                hit_target_index = None
+
+                for index, target in enumerate(targets):
+                    x_difference = bullet["x"] - target["x"]
+                    y_difference = bullet["y"] - target["y"]
+
+                    collision_distance = (
+                        target["radius"] + BULLET_RADIUS
+                    )
+
+                    if (
+                        x_difference * x_difference
+                        + y_difference * y_difference
+                        <= collision_distance * collision_distance
+                    ):
+                        hit_target_index = index
+                        break
+
+                if hit_target_index is not None:
+                    targets.pop(hit_target_index)
+                    targets.append(create_target())
+                    score += 1
+                else:
+                    remaining_bullets.append(bullet)
+
+            bullets = remaining_bullets
+
+            # -------------------------------------------------
+            # DRAW GAME
+            # -------------------------------------------------
+
+            frame = np.zeros(
+                (WINDOW_HEIGHT, WINDOW_WIDTH, 3),
+                dtype=np.uint8,
+            )
+
+            frame[:] = (18, 21, 29)
+
+            # Decorative horizontal lines
+            for y_position in range(200, WINDOW_HEIGHT - 100, 80):
+                cv2.line(
+                    frame,
+                    (0, y_position),
+                    (WINDOW_WIDTH, y_position),
+                    (30, 34, 44),
+                    1,
+                )
+
+            # Draw target balls
+            for target in targets:
+                centre = (
+                    int(target["x"]),
+                    int(target["y"]),
+                )
+
+                cv2.circle(
+                    frame,
+                    centre,
+                    target["radius"],
+                    target["colour"],
+                    -1,
+                    cv2.LINE_AA,
+                )
+
+                cv2.circle(
+                    frame,
+                    (
+                        centre[0] - target["radius"] // 3,
+                        centre[1] - target["radius"] // 3,
+                    ),
+                    max(4, target["radius"] // 6),
+                    (245, 245, 245),
+                    -1,
+                    cv2.LINE_AA,
+                )
+
+            # Draw bullets
+            for bullet in bullets:
+                bullet_centre = (
+                    int(bullet["x"]),
+                    int(bullet["y"]),
+                )
+
+                cv2.circle(
+                    frame,
+                    bullet_centre,
+                    BULLET_RADIUS + 4,
+                    (40, 110, 255),
+                    -1,
+                    cv2.LINE_AA,
+                )
+
+                cv2.circle(
+                    frame,
+                    bullet_centre,
+                    BULLET_RADIUS,
+                    (100, 240, 255),
+                    -1,
+                    cv2.LINE_AA,
+                )
+
+            draw_gun(frame, firing)
+
+            draw_interface(
+                frame,
+                current_distance,
+                firing,
+                connection is not None,
+                score,
+            )
+
+            cv2.imshow(
+                "ESP32-S3 TOF Ball Shooter",
+                frame,
+            )
+
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord("q") or key == 27:
+                break
+
+            if key == ord("r"):
+                score = 0
+                bullets.clear()
+                targets = [
+                    create_target()
+                    for _ in range(NUMBER_OF_TARGETS)
+                ]
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+        cv2.destroyAllWindows()
+        print("Game closed.")
+
+
+if __name__ == "__main__":
+    main()
