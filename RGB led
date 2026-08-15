@@ -1,0 +1,57 @@
+// Common Anode RGB LED
+// Red   -> Pin 11
+// Green -> Pin 10
+// Blue  -> Pin 9
+// Common pin -> 5V
+
+const int RED = 11;
+const int GREEN = 10;
+const int BLUE = 9;
+
+void setup() {
+  pinMode(RED, OUTPUT);
+  pinMode(GREEN, OUTPUT);
+  pinMode(BLUE, OUTPUT);
+}
+
+// Set RGB colour for a common-anode LED
+void setColor(int r, int g, int b) {
+  analogWrite(RED, 255 - r);
+  analogWrite(GREEN, 255 - g);
+  analogWrite(BLUE, 255 - b);
+}
+
+void colorWheel(byte position) {
+  if (position < 85) {
+    setColor(
+      255 - position * 3,
+      position * 3,
+      0
+    );
+  }
+  else if (position < 170) {
+    position -= 85;
+
+    setColor(
+      0,
+      255 - position * 3,
+      position * 3
+    );
+  }
+  else {
+    position -= 170;
+
+    setColor(
+      position * 3,
+      0,
+      255 - position * 3
+    );
+  }
+}
+
+void loop() {
+  for (int i = 0; i < 256; i++) {
+    colorWheel(i);
+    delay(20);
+  }
+}
