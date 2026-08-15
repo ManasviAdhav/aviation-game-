@@ -1,0 +1,101 @@
+import time
+from collections import deque
+
+import matplotlib
+
+# Must be written before importing pyplot
+matplotlib.use("TkAgg")
+
+import matplotlib.pyplot as plt
+import serial
+
+
+ARDUINO_PORT = "COM5"
+BAUD_RATE = 9600
+MAX_POINTS = 200
+
+
+try:
+    arduino = serial.Serial(
+        ARDUINO_PORT,
+        BAUD_RATE,
+        timeout=0.2
+    )
+
+except serial.SerialException as error:
+    raise SystemExit(
+        f"Could not open {ARDUINO_PORT}\n"
+        f"Close Arduino Serial Monitor and check the port.\n"
+        f"{error}"
+    )
+
+
+print("Connecting to Arduino...")
+time.sleep(2)
+
+arduino.reset_input_buffer()
+
+values = deque(maxlen=MAX_POINTS)
+
+plt.ion()
+
+fig, ax = plt.subplots()
+
+graph_line, = ax.plot([], [], linewidth=2)
+
+ax.set_title("Arduino Potentiometer")
+ax.set_xlabel("Recent samples")
+ax.set_ylabel("Analog reading")
+ax.set_xlim(0, MAX_POINTS - 1)
+ax.set_ylim(0, 1023)
+ax.grid(True)
+
+plt.tight_layout()
+plt.show(block=False)
+
+
+try:
+    while plt.fignum_exists(fig.number):
+
+        serial_text = arduino.readline().decode(
+            "utf-8",
+            errors="ignore"
+        ).strip()
+
+        if serial_text:
+
+            try:
+                parts = serial_text.split(",")
+
+                analog_value = int(parts[0])
+                voltage = float(parts[1])
+
+                values.append(analog_value)
+
+                x_values = list(range(len(values)))
+
+                graph_line.set_data(
+                    x_values,
+                    list(values)
+                )
+
+                ax.set_title(
+                    f"Potentiometer: {analog_value} ADC | "
+                    f"{voltage:.2f} V"
+                )
+
+                print(
+                    f"ADC: {analog_value} | "
+                    f"Voltage: {voltage:.2f} V"
+                )
+
+                fig.canvas.draw_idle()
+
+            except (ValueError, IndexError):
+                print("Invalid Arduino data:", serial_text)
+
+        plt.pause(0.01)
+
+finally:
+    arduino.close()
+    print("Arduino connection closed.")
