@@ -1,0 +1,112 @@
+#include <Wire.h>
+#include <U8g2lib.h>
+
+// 0.96-inch 128x64 SSD1306 OLED
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(
+  U8G2_R0,
+  U8X8_PIN_NONE
+);
+
+const int FORWARD_BUTTON = 7;
+const int BACKWARD_BUTTON = 6;
+
+int carX = 44;
+
+unsigned long lastMoveTime = 0;
+const unsigned long moveDelay = 50;
+
+void drawCar(int x, int y) {
+  // Car body
+  display.drawBox(x, y + 8, 40, 12);
+
+  // Car roof
+  display.drawBox(x + 10, y, 20, 10);
+
+  // Windows
+  display.setDrawColor(0);
+  display.drawBox(x + 12, y + 2, 7, 6);
+  display.drawBox(x + 21, y + 2, 7, 6);
+  display.setDrawColor(1);
+
+  // Wheels
+  display.drawDisc(x + 9, y + 21, 4);
+  display.drawDisc(x + 31, y + 21, 4);
+
+  // Wheel centres
+  display.setDrawColor(0);
+  display.drawDisc(x + 9, y + 21, 1);
+  display.drawDisc(x + 31, y + 21, 1);
+  display.setDrawColor(1);
+}
+
+void setup() {
+  pinMode(FORWARD_BUTTON, INPUT_PULLUP);
+  pinMode(BACKWARD_BUTTON, INPUT_PULLUP);
+
+  Serial.begin(9600);
+
+  display.begin();
+
+  display.clearBuffer();
+  display.setFont(u8g2_font_6x12_tf);
+  display.drawStr(30, 25, "CAR CONTROL");
+  display.drawStr(45, 42, "READY");
+  display.sendBuffer();
+
+  delay(1500);
+}
+
+void loop() {
+  bool forwardPressed =
+    digitalRead(FORWARD_BUTTON) == LOW;
+
+  bool backwardPressed =
+    digitalRead(BACKWARD_BUTTON) == LOW;
+
+  if (millis() - lastMoveTime >= moveDelay) {
+    lastMoveTime = millis();
+
+    if (forwardPressed && !backwardPressed) {
+      carX = carX + 2;
+    }
+
+    if (backwardPressed && !forwardPressed) {
+      carX = carX - 2;
+    }
+
+    // Keep the car inside the screen
+    carX = constrain(carX, 0, 88);
+  }
+
+  display.clearBuffer();
+
+  display.setFont(u8g2_font_6x12_tf);
+
+  if (forwardPressed && !backwardPressed) {
+    display.drawStr(32, 10, "FORWARD >>");
+  }
+  else if (backwardPressed && !forwardPressed) {
+    display.drawStr(20, 10, "<< BACKWARD");
+  }
+  else if (forwardPressed && backwardPressed) {
+    display.drawStr(26, 10, "BOTH PRESSED");
+  }
+  else {
+    display.drawStr(47, 10, "STOP");
+  }
+
+  // Road
+  display.drawLine(0, 56, 127, 56);
+  display.drawLine(0, 63, 127, 63);
+
+  // Road markings
+  for (int x = 0; x < 128; x += 25) {
+    display.drawLine(x, 60, x + 12, 60);
+  }
+
+  drawCar(carX, 30);
+
+  display.sendBuffer();
+
+  delay(10);
+}
