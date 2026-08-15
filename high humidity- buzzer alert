@@ -1,0 +1,77 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT11.h>
+
+const int dhtPin = 8;
+const int buzzerPin = 7;
+
+DHT11 dht11(dhtPin);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(buzzerPin, OUTPUT);
+  noTone(buzzerPin);
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.setCursor(0, 0);
+  lcd.print("System Starting");
+  delay(2000);
+
+  lcd.clear();
+}
+
+void loop() {
+  int temperature = 0;
+  int humidity = 0;
+
+  int result =
+    dht11.readTemperatureHumidity(temperature, humidity);
+
+  if (result == 0) {
+    // Show temperature and humidity
+    lcd.setCursor(0, 0);
+    lcd.print("T:");
+    lcd.print(temperature);
+    lcd.print((char)223);
+    lcd.print("C H:");
+    lcd.print(humidity);
+    lcd.print("%   ");
+
+    Serial.print("Temperature: ");
+    Serial.print(temperature);
+    Serial.print(" C, Humidity: ");
+    Serial.print(humidity);
+    Serial.println(" %");
+
+    // Buzzer control
+    if (humidity > 80) {
+      tone(buzzerPin, 1000);
+
+      lcd.setCursor(0, 1);
+      lcd.print("Humidity HIGH!  ");
+    } else {
+      noTone(buzzerPin);
+
+      lcd.setCursor(0, 1);
+      lcd.print("Humidity Normal ");
+    }
+  } else {
+    // Turn buzzer off during sensor error
+    noTone(buzzerPin);
+
+    lcd.setCursor(0, 0);
+    lcd.print("Sensor Error!   ");
+
+    lcd.setCursor(0, 1);
+    lcd.print("Check DHT wiring");
+
+    Serial.print("DHT11 error: ");
+    Serial.println(DHT11::getErrorString(result));
+  }
+
+  delay(2000);
+}
