@@ -1,0 +1,153 @@
+#include <WiFi.h>
+#include <ThingSpeak.h>
+#include <DHT.h>
+
+// ================= DHT11 =================
+#define DHT_PIN 48
+#define DHT_TYPE DHT11
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ================= Wi-Fi =================
+const char* WIFI_NAME = "YOUR_WIFI_NAME";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+// ================= ThingSpeak =================
+unsigned long channelID = 3440719;
+const char* writeAPIKey = "S05NG0MR1K0UNJZD";
+
+WiFiClient client;
+
+// ================= Timing =================
+const unsigned long SENSOR_INTERVAL = 5000;      // 5 seconds
+const unsigned long UPLOAD_INTERVAL = 15000;     // 15 seconds
+
+unsigned long previousSensorTime = 0;
+unsigned long previousUploadTime = 0;
+
+// Store readings
+float temperature = 0.0;
+float humidity = 0.0;
+bool validReading = false;
+
+
+// Connect ESP32-S3 to Wi-Fi
+void connectWiFi() {
+  Serial.println();
+  Serial.print("Connecting to Wi-Fi: ");
+  Serial.println(WIFI_NAME);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_NAME, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+
+  Serial.println();
+  Serial.println("Wi-Fi connected!");
+
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+
+// Read DHT11
+void readDHT11() {
+  humidity = dht.readHumidity();
+  temperature = dht.readTemperature();
+
+  if (isnan(temperature) || isnan(humidity)) {
+    validReading = false;
+    Serial.println("DHT11 reading failed! Check wiring.");
+    return;
+  }
+
+  validReading = true;
+
+  Serial.println();
+  Serial.println("DHT11 Reading:");
+
+  Serial.print("Temperature: ");
+  Serial.print(temperature, 1);
+  Serial.println(" °C");
+
+  Serial.print("Humidity: ");
+  Serial.print(humidity, 1);
+  Serial.println(" %");
+
+  Serial.println("----------------------------");
+}
+
+
+// Upload readings to ThingSpeak
+void uploadToThingSpeak() {
+  if (!validReading) {
+    Serial.println("Upload skipped: No valid DHT11 reading.");
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Wi-Fi disconnected. Reconnecting...");
+    connectWiFi();
+  }
+
+  ThingSpeak.setField(1, temperature);
+  ThingSpeak.setField(2, humidity);
+
+  Serial.println("Uploading data to ThingSpeak...");
+
+  int responseCode =
+      ThingSpeak.writeFields(channelID, writeAPIKey);
+
+  if (responseCode == 200) {
+    Serial.println("SUCCESS: Data uploaded to ThingSpeak!");
+  } else {
+    Serial.print("ThingSpeak upload failed. Error code: ");
+    Serial.println(responseCode);
+  }
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("ESP32-S3 DHT11 ThingSpeak");
+  Serial.println("================================");
+
+  dht.begin();
+
+  connectWiFi();
+
+  ThingSpeak.begin(client);
+
+  // Take and upload the first reading immediately
+  readDHT11();
+  uploadToThingSpeak();
+
+  previousSensorTime = millis();
+  previousUploadTime = millis();
+}
+
+
+void loop() {
+  unsigned long currentTime = millis();
+
+  // Read and print DHT11 every 5 seconds
+  if (currentTime - previousSensorTime >= SENSOR_INTERVAL) {
+    previousSensorTime = currentTime;
+    readDHT11();
+  }
+
+  // Upload to ThingSpeak every 15 seconds
+  if (currentTime - previousUploadTime >= UPLOAD_INTERVAL) {
+    previousUploadTime = currentTime;
+    uploadToThingSpeak();
+  }
+
+  delay(10);
+}
