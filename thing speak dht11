@@ -1,0 +1,136 @@
+#include <WiFi.h>
+#include <ThingSpeak.h>
+#include <DHT.h>
+
+// ---------- DHT11 ----------
+#define DHT_PIN 48
+#define DHT_TYPE DHT11
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ---------- Wi-Fi ----------
+const char* WIFI_SSID = "YOUR_WIFI_NAME";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+// ---------- ThingSpeak ----------
+unsigned long channelID = 3440719;
+const char* writeAPIKey = "YOUR_WRITE_API_KEY";
+
+WiFiClient client;
+
+void connectWiFi() {
+  Serial.println();
+  Serial.print("Connecting to Wi-Fi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(500);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int attempts = 0;
+
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    Serial.print(".");
+    delay(500);
+    attempts++;
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Wi-Fi connected successfully!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+
+    Serial.print("Signal strength: ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+  } else {
+    Serial.println("Wi-Fi connection failed!");
+    Serial.println("Check Wi-Fi name and password.");
+    Serial.println("Use a 2.4 GHz Wi-Fi or mobile hotspot.");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("ESP32-S3 DHT11 ThingSpeak Test");
+  Serial.println("================================");
+
+  dht.begin();
+
+  ThingSpeak.begin(client);
+
+  connectWiFi();
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Wi-Fi disconnected. Reconnecting...");
+    connectWiFi();
+
+    if (WiFi.status() != WL_CONNECTED) {
+      delay(5000);
+      return;
+    }
+  }
+
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+
+  if (isnan(temperature) || isnan(humidity)) {
+    Serial.println("DHT11 reading failed!");
+    Serial.println("Check DATA, VCC and GND wiring.");
+    delay(3000);
+    return;
+  }
+
+  Serial.println();
+  Serial.println("Reading DHT11...");
+
+  Serial.print("Temperature: ");
+  Serial.print(temperature, 1);
+  Serial.println(" °C");
+
+  Serial.print("Humidity: ");
+  Serial.print(humidity, 1);
+  Serial.println(" %");
+
+  ThingSpeak.setField(1, temperature);
+  ThingSpeak.setField(2, humidity);
+
+  Serial.println("Sending data to ThingSpeak...");
+
+  int responseCode =
+      ThingSpeak.writeFields(channelID, writeAPIKey);
+
+  Serial.print("ThingSpeak response code: ");
+  Serial.println(responseCode);
+
+  if (responseCode == 200) {
+    Serial.println("SUCCESS: Data uploaded to ThingSpeak!");
+  } else {
+    Serial.println("FAILED: Data was not uploaded.");
+
+    if (responseCode == 401) {
+      Serial.println("Check the Write API Key.");
+    } else if (responseCode == 404) {
+      Serial.println("Check the Channel ID.");
+    } else if (responseCode == -301) {
+      Serial.println("Could not connect to ThingSpeak server.");
+    } else {
+      Serial.println("Check Wi-Fi, Channel ID and Write API Key.");
+    }
+  }
+
+  Serial.println("Waiting 20 seconds...");
+  Serial.println("--------------------------------");
+
+  delay(20000);
+}
