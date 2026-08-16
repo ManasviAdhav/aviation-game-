@@ -1,0 +1,1540 @@
+/*
+   =============================================================
+        FINAL AVIATION REMOTE - ESP32-S3
+        PANDA3D FLIGHT SIMULATOR
+
+        FINAL HARDWARE VERSION
+        NO MPU6050
+   =============================================================
+
+   WIFI:
+      SSID     : AVIATION_REMOTE
+      PASSWORD : fly12345
+
+   UDP:
+      ESP32 -> Panda3D : 4210
+      Panda3D -> ESP32 : 4211
+
+   CONTROLS:
+      Joystick X      = Roll
+      Joystick Y      = Pitch
+
+      Encoder         = Throttle
+      Encoder Press   = Throttle IDLE
+
+      Rudder Left     = GPIO 11
+      Rudder Right    = GPIO 12
+
+      Flaps Down      = GPIO 13
+      Flaps Up        = GPIO 17
+
+      Gear Toggle     = GPIO 10
+
+      Camera          = GPIO 18
+      Autopilot       = GPIO 38
+
+      Joystick Press  = Extra / camera-center event
+
+   OUTPUTS:
+      OLED
+      Green LED
+      Yellow LED
+      Red LED
+      Buzzer
+      Vibration Motor
+   =============================================================
+*/
+
+
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <Wire.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+
+// =============================================================
+// WIFI
+// =============================================================
+
+const char* WIFI_SSID = "AVIATION_REMOTE";
+const char* WIFI_PASS = "fly12345";
+
+WiFiUDP udpSend;
+WiFiUDP udpReceive;
+
+const uint16_t GAME_PORT = 4210;
+const uint16_t FEEDBACK_PORT = 4211;
+
+IPAddress gameIP(192, 168, 4, 255);
+
+
+// =============================================================
+// FINAL PIN MAP
+// =============================================================
+
+// Joystick
+const int JOY_X_PIN  = 1;
+const int JOY_Y_PIN  = 2;
+const int JOY_SW_PIN = 40;
+
+// Gear
+const int GEAR_PIN = 10;
+
+// Flight buttons
+const int BTN_RUDDER_LEFT  = 11;
+const int BTN_RUDDER_RIGHT = 12;
+
+const int BTN_FLAPS_DOWN = 13;
+const int BTN_FLAPS_UP   = 17;
+
+const int BTN_CAMERA    = 18;
+const int BTN_AUTOPILOT = 38;
+
+// Rotary encoder
+const int ENC_CLK_PIN = 14;
+const int ENC_DT_PIN  = 15;
+const int ENC_SW_PIN  = 16;
+
+// OLED I2C
+const int SDA_PIN = 41;
+const int SCL_PIN = 42;
+
+// LEDs
+const int LED_GREEN  = 4;
+const int LED_YELLOW = 5;
+const int LED_RED    = 6;
+
+// Feedback
+const int BUZZER_PIN = 7;
+const int VIB_PIN    = 47;
+
+
+// =============================================================
+// OLED
+// =============================================================
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &Wire,
+  -1
+);
+
+const uint8_t OLED_ADDRESS = 0x3C;
+
+bool oledOK = false;
+
+
+// =============================================================
+// JOYSTICK
+// =============================================================
+
+int joyCenterX = 2048;
+int joyCenterY = 2048;
+
+const float JOY_DEADZONE = 0.07;
+
+
+// =============================================================
+// THROTTLE
+// =============================================================
+
+int throttle = 0;
+
+int lastEncoderCLK = HIGH;
+
+unsigned long lastEncoderTime = 0;
+
+const int THROTTLE_STEP = 2;
+
+
+// =============================================================
+// EVENT COUNTERS
+//
+// Counter changes are more reliable than sending a one-frame
+// pulse through UDP.
+// =============================================================
+
+uint32_t cameraEvent       = 0;
+uint32_t autopilotEvent    = 0;
+uint32_t flapsDownEvent    = 0;
+uint32_t flapsUpEvent      = 0;
+uint32_t joystickPressEvent = 0;
+
+
+// =============================================================
+// PREVIOUS BUTTON STATES
+// =============================================================
+
+bool oldCameraButton     = HIGH;
+bool oldAutopilotButton  = HIGH;
+bool oldFlapsDownButton  = HIGH;
+bool oldFlapsUpButton    = HIGH;
+bool oldJoystickButton   = HIGH;
+bool oldEncoderButton    = HIGH;
+
+
+// =============================================================
+// GAME FEEDBACK DATA
+// =============================================================
+
+String missionText = "CONNECT TO GAME";
+String warningText = "";
+
+int gameAltitude = 0;
+int gameSpeed    = 0;
+
+String gameStatus = "WAIT";
+
+unsigned long vibrationEnd = 0;
+unsigned long buzzerEnd    = 0;
+
+
+// =============================================================
+// TIMERS
+// =============================================================
+
+unsigned long lastPacketTime = 0;
+unsigned long lastOLEDTime   = 0;
+
+const unsigned long PACKET_INTERVAL = 20;   // 50 Hz
+const unsigned long OLED_INTERVAL   = 120;
+
+
+// =============================================================
+// JOYSTICK HELPERS
+// =============================================================
+
+float applyDeadzone(float value)
+{
+  if (fabs(value) < JOY_DEADZONE)
+  {
+    return 0.0;
+  }
+
+  return value;
+}
+
+
+float normalizeJoystick(
+  int rawValue,
+  int center
+)
+{
+  float value;
+
+  if (rawValue >= center)
+  {
+    value =
+      (float)(rawValue - center) /
+      (4095.0 - center);
+  }
+  else
+  {
+    value =
+      (float)(rawValue - center) /
+      center;
+  }
+
+  value =
+    constrain(
+      value,
+      -1.0,
+      1.0
+    );
+
+  return applyDeadzone(value);
+}
+
+
+// =============================================================
+// JOYSTICK CALIBRATION
+// =============================================================
+
+void calibrateJoystick()
+{
+  long sumX = 0;
+  long sumY = 0;
+
+  const int samples = 120;
+
+  for (int i = 0; i < samples; i++)
+  {
+    sumX += analogRead(JOY_X_PIN);
+    sumY += analogRead(JOY_Y_PIN);
+
+    delay(4);
+  }
+
+  joyCenterX =
+    sumX / samples;
+
+  joyCenterY =
+    sumY / samples;
+}
+
+
+// =============================================================
+// ROTARY ENCODER
+// =============================================================
+
+void updateEncoder()
+{
+  int currentCLK =
+    digitalRead(ENC_CLK_PIN);
+
+  if (
+    currentCLK != lastEncoderCLK &&
+    currentCLK == LOW
+  )
+  {
+    if (
+      millis() - lastEncoderTime >
+      3
+    )
+    {
+      if (
+        digitalRead(ENC_DT_PIN) !=
+        currentCLK
+      )
+      {
+        throttle += THROTTLE_STEP;
+      }
+      else
+      {
+        throttle -= THROTTLE_STEP;
+      }
+
+      throttle =
+        constrain(
+          throttle,
+          0,
+          100
+        );
+
+      lastEncoderTime =
+        millis();
+    }
+  }
+
+  lastEncoderCLK =
+    currentCLK;
+
+
+  // Encoder push = THROTTLE IDLE
+  bool encoderButton =
+    digitalRead(ENC_SW_PIN);
+
+  if (
+    oldEncoderButton == HIGH &&
+    encoderButton == LOW
+  )
+  {
+    throttle = 0;
+
+    Serial.println(
+      "THROTTLE -> IDLE"
+    );
+  }
+
+  oldEncoderButton =
+    encoderButton;
+}
+
+
+// =============================================================
+// BUTTON EVENTS
+// =============================================================
+
+void updateButtonEvents()
+{
+  bool camera =
+    digitalRead(BTN_CAMERA);
+
+  bool autopilot =
+    digitalRead(BTN_AUTOPILOT);
+
+  bool flapsDown =
+    digitalRead(BTN_FLAPS_DOWN);
+
+  bool flapsUp =
+    digitalRead(BTN_FLAPS_UP);
+
+  bool joystickButton =
+    digitalRead(JOY_SW_PIN);
+
+
+  // CAMERA
+  if (
+    oldCameraButton == HIGH &&
+    camera == LOW
+  )
+  {
+    cameraEvent++;
+
+    Serial.println(
+      "CAMERA EVENT"
+    );
+  }
+
+
+  // AUTOPILOT
+  if (
+    oldAutopilotButton == HIGH &&
+    autopilot == LOW
+  )
+  {
+    autopilotEvent++;
+
+    Serial.println(
+      "AUTOPILOT EVENT"
+    );
+  }
+
+
+  // FLAPS DOWN
+  if (
+    oldFlapsDownButton == HIGH &&
+    flapsDown == LOW
+  )
+  {
+    flapsDownEvent++;
+
+    Serial.println(
+      "FLAPS DOWN EVENT"
+    );
+  }
+
+
+  // FLAPS UP
+  if (
+    oldFlapsUpButton == HIGH &&
+    flapsUp == LOW
+  )
+  {
+    flapsUpEvent++;
+
+    Serial.println(
+      "FLAPS UP EVENT"
+    );
+  }
+
+
+  // JOYSTICK PRESS
+  if (
+    oldJoystickButton == HIGH &&
+    joystickButton == LOW
+  )
+  {
+    joystickPressEvent++;
+
+    Serial.println(
+      "JOYSTICK PRESS EVENT"
+    );
+  }
+
+
+  oldCameraButton =
+    camera;
+
+  oldAutopilotButton =
+    autopilot;
+
+  oldFlapsDownButton =
+    flapsDown;
+
+  oldFlapsUpButton =
+    flapsUp;
+
+  oldJoystickButton =
+    joystickButton;
+}
+
+
+// =============================================================
+// SEND CONTROLLER DATA TO PANDA3D
+// =============================================================
+
+void sendControlPacket()
+{
+  if (
+    millis() - lastPacketTime <
+    PACKET_INTERVAL
+  )
+  {
+    return;
+  }
+
+  lastPacketTime =
+    millis();
+
+
+  // -------------------------
+  // JOYSTICK
+  // -------------------------
+
+  int rawX =
+    analogRead(JOY_X_PIN);
+
+  int rawY =
+    analogRead(JOY_Y_PIN);
+
+
+  float roll =
+    normalizeJoystick(
+      rawX,
+      joyCenterX
+    );
+
+
+  float pitch =
+    normalizeJoystick(
+      rawY,
+      joyCenterY
+    );
+
+
+  // Aircraft-style pitch direction
+  pitch *= -1.0;
+
+
+  // -------------------------
+  // RUDDER
+  // -------------------------
+
+  int rudderLeft =
+    digitalRead(
+      BTN_RUDDER_LEFT
+    ) == LOW;
+
+
+  int rudderRight =
+    digitalRead(
+      BTN_RUDDER_RIGHT
+    ) == LOW;
+
+
+  // -------------------------
+  // GEAR
+  // -------------------------
+
+  int gear =
+    digitalRead(
+      GEAR_PIN
+    ) == LOW;
+
+
+  // ===========================================================
+  // BUILD PACKET
+  // ===========================================================
+
+  String packet;
+
+  packet.reserve(260);
+
+
+  packet += "ROLL=";
+  packet += String(roll, 3);
+
+
+  packet += ";PITCH=";
+  packet += String(pitch, 3);
+
+
+  packet += ";THROTTLE=";
+  packet += throttle;
+
+
+  packet += ";RUDDER_L=";
+  packet += rudderLeft;
+
+
+  packet += ";RUDDER_R=";
+  packet += rudderRight;
+
+
+  packet += ";GEAR=";
+  packet += gear;
+
+
+  packet += ";FLAPS_DN_EVT=";
+  packet += flapsDownEvent;
+
+
+  packet += ";FLAPS_UP_EVT=";
+  packet += flapsUpEvent;
+
+
+  packet += ";CAM_EVT=";
+  packet += cameraEvent;
+
+
+  packet += ";AP_EVT=";
+  packet += autopilotEvent;
+
+
+  packet += ";JOY_EVT=";
+  packet += joystickPressEvent;
+
+
+  packet += ";TIME=";
+  packet += millis();
+
+
+  udpSend.beginPacket(
+    gameIP,
+    GAME_PORT
+  );
+
+  udpSend.print(packet);
+
+  udpSend.endPacket();
+
+
+  // Serial debug every 500 ms
+  static unsigned long debugTimer = 0;
+
+  if (
+    millis() - debugTimer >
+    500
+  )
+  {
+    Serial.println(packet);
+
+    debugTimer =
+      millis();
+  }
+}
+
+
+// =============================================================
+// READ FIELD FROM PANDA3D FEEDBACK
+// =============================================================
+
+String readField(
+  String data,
+  String key
+)
+{
+  String search =
+    key + "=";
+
+  int start =
+    data.indexOf(search);
+
+  if (start < 0)
+  {
+    return "";
+  }
+
+  start +=
+    search.length();
+
+
+  int end =
+    data.indexOf(
+      ';',
+      start
+    );
+
+
+  if (end < 0)
+  {
+    end =
+      data.length();
+  }
+
+
+  return data.substring(
+    start,
+    end
+  );
+}
+
+
+// =============================================================
+// RECEIVE GAME FEEDBACK
+// =============================================================
+
+void receiveGameFeedback()
+{
+  int packetSize =
+    udpReceive.parsePacket();
+
+  if (!packetSize)
+  {
+    return;
+  }
+
+
+  char buffer[512];
+
+  int length =
+    udpReceive.read(
+      buffer,
+      sizeof(buffer) - 1
+    );
+
+
+  if (length <= 0)
+  {
+    return;
+  }
+
+
+  buffer[length] = '\0';
+
+  String data =
+    String(buffer);
+
+
+  String value;
+
+
+  // MISSION
+  value =
+    readField(
+      data,
+      "MISSION"
+    );
+
+  if (value.length())
+  {
+    missionText = value;
+  }
+
+
+  // WARNING
+  value =
+    readField(
+      data,
+      "WARN"
+    );
+
+  warningText = value;
+
+
+  // ALTITUDE
+  value =
+    readField(
+      data,
+      "ALT"
+    );
+
+  if (value.length())
+  {
+    gameAltitude =
+      value.toInt();
+  }
+
+
+  // SPEED
+  value =
+    readField(
+      data,
+      "SPD"
+    );
+
+  if (value.length())
+  {
+    gameSpeed =
+      value.toInt();
+  }
+
+
+  // STATUS
+  value =
+    readField(
+      data,
+      "STATUS"
+    );
+
+  if (value.length())
+  {
+    gameStatus = value;
+  }
+
+
+  // VIBRATION
+  value =
+    readField(
+      data,
+      "VIB"
+    );
+
+  if (
+    value.length() &&
+    value.toInt() > 0
+  )
+  {
+    vibrationEnd =
+      millis() +
+      value.toInt();
+  }
+
+
+  // BEEP
+  value =
+    readField(
+      data,
+      "BEEP"
+    );
+
+  if (
+    value.length() &&
+    value.toInt() > 0
+  )
+  {
+    buzzerEnd =
+      millis() +
+      value.toInt();
+  }
+}
+
+
+// =============================================================
+// LED / BUZZER / VIBRATION FEEDBACK
+// =============================================================
+
+void updateFeedbackOutputs()
+{
+  bool laptopConnected =
+    WiFi.softAPgetStationNum() > 0;
+
+
+  bool danger =
+    warningText.length() > 0;
+
+
+  // GREEN
+  digitalWrite(
+    LED_GREEN,
+    laptopConnected && !danger
+  );
+
+
+  // YELLOW
+  digitalWrite(
+    LED_YELLOW,
+    !laptopConnected
+  );
+
+
+  // RED
+  digitalWrite(
+    LED_RED,
+    danger
+  );
+
+
+  // -------------------------
+  // VIBRATION
+  // -------------------------
+
+  if (
+    millis() <
+    vibrationEnd
+  )
+  {
+    digitalWrite(
+      VIB_PIN,
+      HIGH
+    );
+  }
+  else
+  {
+    digitalWrite(
+      VIB_PIN,
+      LOW
+    );
+  }
+
+
+  // -------------------------
+  // BUZZER
+  // -------------------------
+
+  bool buzzerActive =
+    millis() <
+    buzzerEnd;
+
+
+  // Repeating warning chirp
+  if (
+    danger &&
+    millis() % 900 < 170
+  )
+  {
+    buzzerActive = true;
+  }
+
+
+  if (buzzerActive)
+  {
+    ledcWriteTone(
+      BUZZER_PIN,
+      1800
+    );
+  }
+  else
+  {
+    ledcWriteTone(
+      BUZZER_PIN,
+      0
+    );
+  }
+}
+
+
+// =============================================================
+// OLED
+// =============================================================
+
+void updateOLED()
+{
+  if (!oledOK)
+  {
+    return;
+  }
+
+
+  if (
+    millis() - lastOLEDTime <
+    OLED_INTERVAL
+  )
+  {
+    return;
+  }
+
+
+  lastOLEDTime =
+    millis();
+
+
+  display.clearDisplay();
+
+  display.setTextColor(
+    SSD1306_WHITE
+  );
+
+
+  // ===========================================================
+  // TOP HEADER
+  // ===========================================================
+
+  display.setTextSize(1);
+
+  display.setCursor(
+    0,
+    0
+  );
+
+  display.print(
+    "FLIGHT 001"
+  );
+
+
+  display.setCursor(
+    95,
+    0
+  );
+
+
+  if (
+    WiFi.softAPgetStationNum() >
+    0
+  )
+  {
+    display.print(
+      "LINK"
+    );
+  }
+  else
+  {
+    display.print(
+      "WAIT"
+    );
+  }
+
+
+  display.drawLine(
+    0,
+    9,
+    127,
+    9,
+    SSD1306_WHITE
+  );
+
+
+  // ===========================================================
+  // WARNING SCREEN
+  // ===========================================================
+
+  if (
+    warningText.length() >
+    0
+  )
+  {
+    display.setTextSize(2);
+
+    display.setCursor(
+      0,
+      16
+    );
+
+    display.print(
+      "WARNING"
+    );
+
+
+    display.setTextSize(1);
+
+    display.setCursor(
+      0,
+      40
+    );
+
+    display.print(
+      warningText.substring(
+        0,
+        20
+      )
+    );
+  }
+
+
+  // ===========================================================
+  // NORMAL MISSION SCREEN
+  // ===========================================================
+
+  else
+  {
+    display.setTextSize(1);
+
+    display.setCursor(
+      0,
+      14
+    );
+
+    display.print(
+      "MISSION"
+    );
+
+
+    display.setCursor(
+      0,
+      25
+    );
+
+    display.print(
+      missionText.substring(
+        0,
+        20
+      )
+    );
+
+
+    // ALT
+    display.setCursor(
+      0,
+      42
+    );
+
+    display.print(
+      "ALT "
+    );
+
+    display.print(
+      gameAltitude
+    );
+
+
+    // SPEED
+    display.setCursor(
+      70,
+      42
+    );
+
+    display.print(
+      "SPD "
+    );
+
+    display.print(
+      gameSpeed
+    );
+
+
+    // THROTTLE
+    display.setCursor(
+      0,
+      54
+    );
+
+    display.print(
+      "THR "
+    );
+
+    display.print(
+      throttle
+    );
+
+    display.print(
+      "%"
+    );
+
+
+    // GEAR
+    display.setCursor(
+      72,
+      54
+    );
+
+    display.print(
+      "GEAR "
+    );
+
+
+    if (
+      digitalRead(
+        GEAR_PIN
+      ) == LOW
+    )
+    {
+      display.print(
+        "DN"
+      );
+    }
+    else
+    {
+      display.print(
+        "UP"
+      );
+    }
+  }
+
+
+  display.display();
+}
+
+
+// =============================================================
+// STARTUP OLED
+// =============================================================
+
+void startupOLED()
+{
+  if (!oledOK)
+  {
+    return;
+  }
+
+
+  display.clearDisplay();
+
+  display.setTextColor(
+    SSD1306_WHITE
+  );
+
+
+  display.setTextSize(2);
+
+  display.setCursor(
+    13,
+    9
+  );
+
+  display.println(
+    "AVIATION"
+  );
+
+
+  display.setTextSize(1);
+
+  display.setCursor(
+    25,
+    37
+  );
+
+  display.println(
+    "FLIGHT REMOTE"
+  );
+
+
+  display.setCursor(
+    32,
+    52
+  );
+
+  display.println(
+    "BOOTING..."
+  );
+
+
+  display.display();
+}
+
+
+// =============================================================
+// SETUP
+// =============================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  delay(500);
+
+
+  // ===========================================================
+  // INPUT PINS
+  // ===========================================================
+
+  pinMode(
+    JOY_SW_PIN,
+    INPUT_PULLUP
+  );
+
+
+  pinMode(
+    GEAR_PIN,
+    INPUT_PULLUP
+  );
+
+
+  pinMode(
+    BTN_RUDDER_LEFT,
+    INPUT_PULLUP
+  );
+
+
+  pinMode(
+    BTN_RUDDER_RIGHT,
+    INPUT_PULLUP
+  );
+
+
+  pinMode(
+    BTN_FLAPS_DOWN,
+    INPUT_PULLUP
+  );
+
+
+  pinMode(
+    BTN_FLAPS_UP,
+    INPUT_PULLUP
+  );
+
+
+  pinMode(
+    BTN_CAMERA,
+    INPUT_PULLUP
+  );
+
+
+  pinMode(
+    BTN_AUTOPILOT,
+    INPUT_PULLUP
+  );
+
+
+  pinMode(
+    ENC_CLK_PIN,
+    INPUT_PULLUP
+  );
+
+
+  pinMode(
+    ENC_DT_PIN,
+    INPUT_PULLUP
+  );
+
+
+  pinMode(
+    ENC_SW_PIN,
+    INPUT_PULLUP
+  );
+
+
+  // ===========================================================
+  // OUTPUT PINS
+  // ===========================================================
+
+  pinMode(
+    LED_GREEN,
+    OUTPUT
+  );
+
+
+  pinMode(
+    LED_YELLOW,
+    OUTPUT
+  );
+
+
+  pinMode(
+    LED_RED,
+    OUTPUT
+  );
+
+
+  pinMode(
+    VIB_PIN,
+    OUTPUT
+  );
+
+
+  digitalWrite(
+    LED_GREEN,
+    LOW
+  );
+
+
+  digitalWrite(
+    LED_YELLOW,
+    HIGH
+  );
+
+
+  digitalWrite(
+    LED_RED,
+    LOW
+  );
+
+
+  digitalWrite(
+    VIB_PIN,
+    LOW
+  );
+
+
+  // ===========================================================
+  // BUZZER PWM
+  // ESP32 Arduino Core 3.x
+  // ===========================================================
+
+  ledcAttach(
+    BUZZER_PIN,
+    2000,
+    8
+  );
+
+
+  // ===========================================================
+  // ADC
+  // ===========================================================
+
+  analogReadResolution(12);
+
+
+  // ===========================================================
+  // OLED I2C
+  // ===========================================================
+
+  Wire.begin(
+    SDA_PIN,
+    SCL_PIN
+  );
+
+
+  oledOK =
+    display.begin(
+      SSD1306_SWITCHCAPVCC,
+      OLED_ADDRESS
+    );
+
+
+  if (oledOK)
+  {
+    startupOLED();
+  }
+
+
+  // ===========================================================
+  // JOYSTICK CALIBRATION
+  // ===========================================================
+
+  // DO NOT TOUCH JOYSTICK
+  // during first ~1 second of boot.
+  calibrateJoystick();
+
+
+  // ===========================================================
+  // ENCODER INITIAL STATE
+  // ===========================================================
+
+  lastEncoderCLK =
+    digitalRead(
+      ENC_CLK_PIN
+    );
+
+
+  // ===========================================================
+  // WIFI ACCESS POINT
+  // ===========================================================
+
+  WiFi.mode(
+    WIFI_AP
+  );
+
+
+  WiFi.softAP(
+    WIFI_SSID,
+    WIFI_PASS
+  );
+
+
+  delay(500);
+
+
+  // Panda -> controller feedback
+  udpReceive.begin(
+    FEEDBACK_PORT
+  );
+
+
+  // ===========================================================
+  // SERIAL STARTUP INFO
+  // ===========================================================
+
+  Serial.println();
+
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    "FINAL AVIATION REMOTE READY"
+  );
+
+  Serial.println(
+    "================================"
+  );
+
+
+  Serial.print(
+    "WiFi: "
+  );
+
+  Serial.println(
+    WIFI_SSID
+  );
+
+
+  Serial.print(
+    "ESP IP: "
+  );
+
+  Serial.println(
+    WiFi.softAPIP()
+  );
+
+
+  Serial.print(
+    "Game UDP: "
+  );
+
+  Serial.println(
+    GAME_PORT
+  );
+
+
+  Serial.print(
+    "Feedback UDP: "
+  );
+
+  Serial.println(
+    FEEDBACK_PORT
+  );
+
+
+  Serial.print(
+    "Joystick X center: "
+  );
+
+  Serial.println(
+    joyCenterX
+  );
+
+
+  Serial.print(
+    "Joystick Y center: "
+  );
+
+  Serial.println(
+    joyCenterY
+  );
+
+
+  Serial.println(
+    "MPU6050: NOT USED"
+  );
+
+
+  Serial.println(
+    "AUTOPILOT GPIO: 38"
+  );
+
+
+  Serial.println(
+    "================================"
+  );
+
+
+  // ===========================================================
+  // STARTUP BEEP
+  // ===========================================================
+
+  ledcWriteTone(
+    BUZZER_PIN,
+    1500
+  );
+
+  delay(90);
+
+
+  ledcWriteTone(
+    BUZZER_PIN,
+    0
+  );
+
+  delay(60);
+
+
+  ledcWriteTone(
+    BUZZER_PIN,
+    2100
+  );
+
+  delay(120);
+
+
+  ledcWriteTone(
+    BUZZER_PIN,
+    0
+  );
+}
+
+
+// =============================================================
+// MAIN LOOP
+// =============================================================
+
+void loop()
+{
+  updateEncoder();
+
+  updateButtonEvents();
+
+  sendControlPacket();
+
+  receiveGameFeedback();
+
+  updateFeedbackOutputs();
+
+  updateOLED();
+}
