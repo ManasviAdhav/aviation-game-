@@ -1,0 +1,1378 @@
+from __future__ import annotations
+
+import json
+import math
+import socket
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+from direct.gui.DirectGui import DirectFrame, DirectLabel
+from direct.showbase.ShowBase import ShowBase
+from direct.task import Task
+from panda3d.core import (
+    AmbientLight,
+    ClockObject,
+    DirectionalLight,
+    LColor,
+    LineSegs,
+    Point3,
+    TextNode,
+    WindowProperties,
+    loadPrcFileData,
+)
+
+# ============================================================
+# FINAL AVIATION GAME
+# Blender world + real aircraft + 4 checkpoint mission
+# ESP32-S3 UDP controller
+# ============================================================
+
+loadPrcFileData("", "window-title AVIATION MISSION")
+loadPrcFileData("", "win-size 1440 810")
+loadPrcFileData("", "sync-video true")
+loadPrcFileData("", "show-frame-rate-meter true")
+loadPrcFileData("", "background-color 0.30 0.65 0.94 1")
+loadPrcFileData("", "framebuffer-multisample 1")
+loadPrcFileData("", "multisamples 4")
+
+# ============================================================
+# FILES
+# ============================================================
+
+WORLD_FILE = "aviation_world_final.glb"
+AIRCRAFT_FILE = "aircraft.glb"
+
+# The aircraft visual is automatically centred, grounded and scaled.
+AIRCRAFT_TARGET_MAX_SIZE = 18.0
+
+# If your aircraft GLB itself points backward/sideways, change ONLY this.
+# Try: 0, 90, 180, or -90.
+AIRCRAFT_MODEL_HEADING_OFFSET = 180.0
+
+# ============================================================
+# REAL BLENDER COORDINATES YOU PROVIDED
+# ============================================================
+
+TAKEOFF_START = Point3(-631.0, -787.0, 2.33)
+TAKEOFF_END = Point3(-1131.0, -786.0, -0.927)
+
+CHECKPOINTS = [
+    Point3(-663.0, 263.0, 311.0),
+    Point3(1026.0, 468.0, 215.0),
+    Point3(225.0, -926.0, 215.0),
+    Point3(-1677.0, -1603.0, 199.0),
+]
+
+LANDING_START = Point3(-704.0, -2010.0, -6.08)
+LANDING_TOUCHDOWN = Point3(-364.0, -2010.0, -6.08)
+LANDING_END = Point3(288.0, -1880.0, -6.08)
+
+# A visible approach ring slightly above the runway start.
+LANDING_APPROACH_GATE = Point3(
+    LANDING_START.x,
+    LANDING_START.y,
+    LANDING_START.z + 55.0,
+)
+
+CHECKPOINT_RADIUS = 58.0
+APPROACH_RADIUS = 75.0
+LANDING_RUNWAY_HALF_WIDTH = 65.0
+
+# ============================================================
+# NETWORK
+# Existing controller protocol
+# ESP32 -> Python : 4210
+# Python -> ESP32 : 4211
+# ============================================================
+
+LISTEN_PORT = 4210
+FEEDBACK_PORT = 4211
+CONTROLLER_TIMEOUT = 1.2
+
+
+@dataclass
+class ControllerState:
+    roll: float = 0.0
+    pitch: float = 0.0
+    throttle: float = 0.0
+    rudder_left: bool = False
+    rudder_right: bool = False
+    flaps: int = 0
+    gear: bool = True
+    camera_counter: int = 0
+    centre_counter: int = 0
+    autopilot_request: bool = False
+    sender_ip: str | None = None
+    last_packet_time: float = 0.0
+
+
+controller = ControllerState()
+controller_lock = threading.Lock()
+network_running = True
+feedback_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def safe_float(data: dict, key: str, default: float = 0.0) -> float:
+    try:
+        return float(data.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_bool(data: dict, key: str, default: bool = False) -> bool:
+    value = data.get(key, default)
+    if isinstance(value, bool):
+        return value
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_remote_packet(message: str) -> dict[str, str]:
+    """Parse ESP32 packets of the form KEY=value;KEY=value;..."""
+    result: dict[str, str] = {}
+
+    for part in message.strip().split(";"):
+        if "=" not in part:
+            continue
+
+        key, value = part.split("=", 1)
+        result[key.strip()] = value.strip()
+
+    return result
+
+
+def field_float(data: dict[str, str], key: str, default: float = 0.0) -> float:
+    try:
+        return float(data.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def field_int(data: dict[str, str], key: str, default: int = 0) -> int:
+    try:
+        return int(float(data.get(key, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def udp_receiver() -> None:
+    """
+    Receive the FINAL ESP32 remote protocol.
+
+    ESP32 sends:
+      ROLL=-1..1
+      PITCH=-1..1
+      THROTTLE=0..100
+      RUDDER_L=0/1
+      RUDDER_R=0/1
+      GEAR=0/1
+      FLAPS_DN_EVT=counter
+      FLAPS_UP_EVT=counter
+      CAM_EVT=counter
+      AP_EVT=counter
+      JOY_EVT=counter
+    """
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    try:
+        sock.bind(("0.0.0.0", LISTEN_PORT))
+    except OSError as error:
+        print(f"Could not open UDP port {LISTEN_PORT}: {error}")
+        return
+
+    sock.settimeout(0.25)
+
+    # Event counters survive packet loss because the ESP32 sends totals.
+    last_flaps_down_event = 0
+    last_flaps_up_event = 0
+    current_flaps = 0
+
+    print("\n========================================")
+    print("AVIATION GAME NETWORK READY")
+    print(f"ESP32 -> Python UDP {LISTEN_PORT}")
+    print(f"Python -> ESP32 UDP {FEEDBACK_PORT}")
+    print("REMOTE PROTOCOL: FINAL SEMICOLON FORMAT")
+    print("Connect Mac Wi-Fi to: AVIATION_REMOTE")
+    print("Password: fly12345")
+    print("========================================\n")
+
+    while network_running:
+        try:
+            payload, address = sock.recvfrom(4096)
+
+            message = payload.decode("utf-8", errors="ignore").strip()
+
+            if not message:
+                continue
+
+            data = parse_remote_packet(message)
+
+            # Joystick is sent by your ESP32 as -1.0 .. +1.0.
+            # The flight physics uses -100 .. +100.
+            roll = clamp(
+                field_float(data, "ROLL", 0.0) * 100.0,
+                -100.0,
+                100.0,
+            )
+
+            pitch = clamp(
+                field_float(data, "PITCH", 0.0) * 100.0,
+                -100.0,
+                100.0,
+            )
+
+            throttle = clamp(
+                field_float(data, "THROTTLE", 0.0),
+                0.0,
+                100.0,
+            )
+
+            rudder_left = field_int(data, "RUDDER_L", 0) != 0
+            rudder_right = field_int(data, "RUDDER_R", 0) != 0
+            gear = field_int(data, "GEAR", 0) != 0
+
+            # ---------------------------------------------------
+            # FLAPS
+            # FLAPS_DN event = add flap angle: 0 -> 10 -> 20 -> 30
+            # FLAPS_UP event = remove flap angle: 30 -> 20 -> 10 -> 0
+            # ---------------------------------------------------
+
+            flaps_down_event = field_int(
+                data,
+                "FLAPS_DN_EVT",
+                last_flaps_down_event,
+            )
+
+            flaps_up_event = field_int(
+                data,
+                "FLAPS_UP_EVT",
+                last_flaps_up_event,
+            )
+
+            # If ESP32 rebooted, its counters can reset to zero.
+            if flaps_down_event < last_flaps_down_event:
+                last_flaps_down_event = flaps_down_event
+
+            if flaps_up_event < last_flaps_up_event:
+                last_flaps_up_event = flaps_up_event
+
+            down_delta = max(
+                0,
+                flaps_down_event - last_flaps_down_event,
+            )
+
+            up_delta = max(
+                0,
+                flaps_up_event - last_flaps_up_event,
+            )
+
+            if down_delta:
+                current_flaps = int(
+                    clamp(
+                        current_flaps + 10 * down_delta,
+                        0,
+                        30,
+                    )
+                )
+
+            if up_delta:
+                current_flaps = int(
+                    clamp(
+                        current_flaps - 10 * up_delta,
+                        0,
+                        30,
+                    )
+                )
+
+            last_flaps_down_event = flaps_down_event
+            last_flaps_up_event = flaps_up_event
+
+            # Camera event total can go directly into the existing
+            # camera-counter logic.
+            camera_event = field_int(data, "CAM_EVT", 0)
+
+            # Joystick press returns chase camera to centre.
+            joystick_event = field_int(data, "JOY_EVT", 0)
+
+            # AP_EVT is a press counter. Odd = requested ON,
+            # even = requested OFF.
+            autopilot_event = field_int(data, "AP_EVT", 0)
+            autopilot_request = (autopilot_event % 2) == 1
+
+            with controller_lock:
+                controller.roll = roll
+                controller.pitch = pitch
+                controller.throttle = throttle
+
+                controller.rudder_left = rudder_left
+                controller.rudder_right = rudder_right
+
+                controller.flaps = current_flaps
+                controller.gear = gear
+
+                controller.camera_counter = camera_event
+                controller.centre_counter = joystick_event
+                controller.autopilot_request = autopilot_request
+
+                controller.sender_ip = address[0]
+                controller.last_packet_time = time.monotonic()
+
+        except socket.timeout:
+            continue
+
+        except OSError:
+            continue
+
+        except Exception as error:
+            # Keep the game alive even if one malformed UDP packet arrives.
+            print("Remote packet warning:", error)
+            continue
+
+    sock.close()
+
+
+threading.Thread(target=udp_receiver, daemon=True).start()
+
+
+def controller_snapshot() -> ControllerState:
+    with controller_lock:
+        return ControllerState(**controller.__dict__)
+
+
+def controller_connected(state: ControllerState) -> bool:
+    return (
+        state.sender_ip is not None
+        and time.monotonic() - state.last_packet_time < CONTROLLER_TIMEOUT
+    )
+
+
+def shortest_angle(target: float, current: float) -> float:
+    return (target - current + 180.0) % 360.0 - 180.0
+
+
+def heading_between(a: Point3, b: Point3) -> float:
+    """Heading convention: 0 = +Y, 90 = +X, 180 = -Y, 270 = -X."""
+    dx = b.x - a.x
+    dy = b.y - a.y
+    return math.degrees(math.atan2(dx, dy)) % 360.0
+
+
+def distance3(a: Point3, b: Point3) -> float:
+    dx = a.x - b.x
+    dy = a.y - b.y
+    dz = a.z - b.z
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+
+
+def distance2(a: Point3, b: Point3) -> float:
+    dx = a.x - b.x
+    dy = a.y - b.y
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def point_to_segment_distance_2d(p: Point3, a: Point3, b: Point3) -> float:
+    abx = b.x - a.x
+    aby = b.y - a.y
+    apx = p.x - a.x
+    apy = p.y - a.y
+    denom = abx * abx + aby * aby
+
+    if denom <= 1e-9:
+        return math.sqrt(apx * apx + apy * apy)
+
+    t = clamp((apx * abx + apy * aby) / denom, 0.0, 1.0)
+    cx = a.x + t * abx
+    cy = a.y + t * aby
+    dx = p.x - cx
+    dy = p.y - cy
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def interpolate_segment_z(p: Point3, a: Point3, b: Point3) -> float:
+    abx = b.x - a.x
+    aby = b.y - a.y
+    apx = p.x - a.x
+    apy = p.y - a.y
+    denom = abx * abx + aby * aby
+
+    if denom <= 1e-9:
+        return a.z
+
+    t = clamp((apx * abx + apy * aby) / denom, 0.0, 1.0)
+    return a.z + (b.z - a.z) * t
+
+
+def make_ring(parent, name: str, radius: float, position: Point3, look_at: Point3):
+    line = LineSegs(name)
+    line.setThickness(7.0)
+    line.setColor(1.0, 0.82, 0.05, 1.0)
+
+    segments = 64
+    for i in range(segments + 1):
+        angle = 2.0 * math.pi * i / segments
+        x = radius * math.cos(angle)
+        z = radius * math.sin(angle)
+        if i == 0:
+            line.moveTo(x, 0, z)
+        else:
+            line.drawTo(x, 0, z)
+
+    ring = parent.attachNewNode(line.create())
+    ring.setPos(position)
+    ring.lookAt(look_at)
+    ring.setLightOff()
+    return ring
+
+
+# ============================================================
+# GAME
+# ============================================================
+
+
+class AviationMissionGame(ShowBase):
+    def __init__(self) -> None:
+        super().__init__()
+        self.disableMouse()
+
+        props = WindowProperties()
+        props.setTitle("AVIATION MISSION")
+        self.win.requestProperties(props)
+
+        # Large imported world.
+        self.camLens.setNearFar(0.1, 1000000.0)
+        self.setBackgroundColor(0.30, 0.65, 0.94, 1)
+
+        self.base_folder = Path(__file__).resolve().parent
+        self.models_folder = self.base_folder / "models"
+
+        self.takeoff_heading = heading_between(TAKEOFF_START, TAKEOFF_END)
+        self.landing_heading = heading_between(LANDING_START, LANDING_TOUCHDOWN)
+
+        # Flight state
+        self.speed = 0.0
+        self.vertical_speed = 0.0
+        self.heading = self.takeoff_heading
+        self.pitch_angle = 0.0
+        self.bank_angle = 0.0
+        self.fuel = 100.0
+        self.rpm = 0.0
+
+        self.airborne = False
+        self.crashed = False
+        self.mission_complete = False
+        self.approach_gate_passed = False
+        self.checkpoint_index = 0
+        self.checkpoint_flash_until = 0.0
+        self.checkpoint_flash_text = ""
+        self.success_until = 0.0
+
+        # Camera / autopilot
+        self.camera_mode = 0
+        self.last_camera_counter = 0
+        self.last_centre_counter = 0
+        self.autopilot_active = False
+        self.last_autopilot_request = False
+        self.autopilot_rejected_until = 0.0
+
+        # Feedback
+        self.last_feedback_send = 0.0
+
+        # Keyboard fallback
+        self.key_map = {
+            "w": False,
+            "s": False,
+            "a": False,
+            "d": False,
+            "q": False,
+            "e": False,
+            "arrow_up": False,
+            "arrow_down": False,
+        }
+        self.keyboard_throttle = 0.0
+        self.keyboard_flaps = 0
+        self.keyboard_gear = True
+        self.keyboard_autopilot = False
+
+        self.setup_keyboard()
+        self.setup_lighting()
+        self.load_world()
+        self.create_mission_rings()
+        self.create_aircraft()
+        self.create_hud()
+
+        self.taskMgr.add(self.update_game, "update_game")
+
+        print(f"Takeoff heading: {self.takeoff_heading:.1f} degrees")
+        print(f"Landing heading: {self.landing_heading:.1f} degrees")
+        print("GAME READY")
+
+    # --------------------------------------------------------
+    # INPUT
+    # --------------------------------------------------------
+
+    def setup_keyboard(self) -> None:
+        for key in self.key_map:
+            self.accept(key, self.set_key, [key, True])
+            self.accept(key + "-up", self.set_key, [key, False])
+
+        self.accept("escape", self.close_game)
+        self.accept("r", self.reset_game)
+        self.accept("c", self.change_camera)
+        self.accept("g", self.toggle_keyboard_gear)
+        self.accept("f", self.keyboard_flaps_up)
+        self.accept("v", self.keyboard_flaps_down)
+        self.accept("p", self.toggle_keyboard_autopilot)
+
+    def set_key(self, key: str, value: bool) -> None:
+        self.key_map[key] = value
+
+    def toggle_keyboard_gear(self) -> None:
+        self.keyboard_gear = not self.keyboard_gear
+
+    def keyboard_flaps_up(self) -> None:
+        self.keyboard_flaps = min(30, self.keyboard_flaps + 10)
+
+    def keyboard_flaps_down(self) -> None:
+        self.keyboard_flaps = max(0, self.keyboard_flaps - 10)
+
+    def toggle_keyboard_autopilot(self) -> None:
+        self.keyboard_autopilot = not self.keyboard_autopilot
+
+    def keyboard_fallback(self, state: ControllerState, dt: float) -> ControllerState:
+        if controller_connected(state):
+            return state
+
+        state.roll = 0.0
+        state.pitch = 0.0
+
+        if self.key_map["a"]:
+            state.roll = -100.0
+        if self.key_map["d"]:
+            state.roll = 100.0
+        if self.key_map["w"]:
+            state.pitch = 100.0
+        if self.key_map["s"]:
+            state.pitch = -100.0
+
+        state.rudder_left = self.key_map["q"]
+        state.rudder_right = self.key_map["e"]
+
+        if self.key_map["arrow_up"]:
+            self.keyboard_throttle = min(100.0, self.keyboard_throttle + 45.0 * dt)
+        if self.key_map["arrow_down"]:
+            self.keyboard_throttle = max(0.0, self.keyboard_throttle - 45.0 * dt)
+
+        state.throttle = self.keyboard_throttle
+        state.flaps = self.keyboard_flaps
+        state.gear = self.keyboard_gear
+        state.autopilot_request = self.keyboard_autopilot
+        return state
+
+    # --------------------------------------------------------
+    # WORLD + REAL AIRCRAFT
+    # --------------------------------------------------------
+
+    def setup_lighting(self) -> None:
+        ambient = AmbientLight("ambient")
+        ambient.setColor(LColor(0.65, 0.65, 0.68, 1))
+        ambient_np = self.render.attachNewNode(ambient)
+        self.render.setLight(ambient_np)
+
+        sun = DirectionalLight("sun")
+        sun.setColor(LColor(1.0, 0.97, 0.90, 1))
+        sun_np = self.render.attachNewNode(sun)
+        sun_np.setHpr(-35, -55, 0)
+        self.render.setLight(sun_np)
+
+    def load_world(self) -> None:
+        world_path = self.models_folder / WORLD_FILE
+
+        if not world_path.exists():
+            # Small fallback for your previous filenames.
+            for filename in ("aviation_world_fixed.glb", "aviation_world.glb"):
+                candidate = self.models_folder / filename
+                if candidate.exists():
+                    world_path = candidate
+                    break
+
+        if not world_path.exists():
+            raise FileNotFoundError(
+                f"World not found. Put {WORLD_FILE} inside the models folder."
+            )
+
+        print("Loading Blender world...")
+        print(world_path)
+        self.world = self.loader.loadModel(str(world_path))
+
+        if self.world.isEmpty():
+            raise RuntimeError("The Blender world GLB could not be loaded.")
+
+        self.world.reparentTo(self.render)
+        self.world.setPos(0, 0, 0)
+        self.world.setScale(1)
+        print("WORLD LOADED")
+
+    def create_aircraft(self) -> None:
+        aircraft_path = self.models_folder / AIRCRAFT_FILE
+
+        if not aircraft_path.exists():
+            raise FileNotFoundError(
+                f"Aircraft not found. Export your plane as {AIRCRAFT_FILE} and place it in models/."
+            )
+
+        # Physics root. All movement/camera logic uses this node.
+        self.aircraft = self.render.attachNewNode("player_aircraft")
+        self.aircraft.setPos(TAKEOFF_START)
+        self.aircraft.setHpr(-self.takeoff_heading, 0, 0)
+
+        print("Loading real aircraft...")
+        print(aircraft_path)
+        self.aircraft_model = self.loader.loadModel(str(aircraft_path))
+
+        if self.aircraft_model.isEmpty():
+            raise RuntimeError("aircraft.glb could not be loaded.")
+
+        self.aircraft_model.reparentTo(self.aircraft)
+        self.aircraft_model.setHpr(AIRCRAFT_MODEL_HEADING_OFFSET, 0, 0)
+
+        # Automatically scale and place the model so its lowest geometry sits on Z=0
+        # of the aircraft physics root.
+        bounds = self.aircraft_model.getTightBounds()
+        if bounds:
+            minimum, maximum = bounds
+            size_x = maximum.x - minimum.x
+            size_y = maximum.y - minimum.y
+            size_z = maximum.z - minimum.z
+            largest = max(size_x, size_y, size_z)
+
+            scale = 1.0
+            if largest > 1e-6:
+                scale = AIRCRAFT_TARGET_MAX_SIZE / largest
+
+            center_x = (minimum.x + maximum.x) * 0.5
+            center_y = (minimum.y + maximum.y) * 0.5
+
+            self.aircraft_model.setScale(scale)
+            self.aircraft_model.setPos(
+                -center_x * scale,
+                -center_y * scale,
+                -minimum.z * scale,
+            )
+
+            print(f"Aircraft auto-scale: {scale:.4f}")
+        else:
+            self.aircraft_model.setScale(1.0)
+            self.aircraft_model.setPos(0, 0, 0)
+
+        print("AIRCRAFT LOADED")
+
+    # --------------------------------------------------------
+    # MISSION RINGS
+    # --------------------------------------------------------
+
+    def create_mission_rings(self) -> None:
+        self.rings = []
+
+        route = CHECKPOINTS + [LANDING_APPROACH_GATE, LANDING_TOUCHDOWN]
+
+        for i, checkpoint in enumerate(CHECKPOINTS):
+            next_point = route[i + 1]
+            ring = make_ring(
+                self.render,
+                f"checkpoint_{i + 1}",
+                46.0,
+                checkpoint,
+                next_point,
+            )
+            self.rings.append(ring)
+
+        self.approach_ring = make_ring(
+            self.render,
+            "landing_approach_gate",
+            58.0,
+            LANDING_APPROACH_GATE,
+            LANDING_TOUCHDOWN,
+        )
+        self.approach_ring.hide()
+
+        # Only current checkpoint is visible.
+        for index, ring in enumerate(self.rings):
+            if index == 0:
+                ring.show()
+            else:
+                ring.hide()
+
+    def update_mission_progress(self) -> None:
+        if self.crashed or self.mission_complete:
+            return
+
+        pos = self.aircraft.getPos(self.render)
+
+        # Checkpoints activate after takeoff.
+        if self.airborne and self.checkpoint_index < len(CHECKPOINTS):
+            target = CHECKPOINTS[self.checkpoint_index]
+
+            if distance3(pos, target) <= CHECKPOINT_RADIUS:
+                cleared_number = self.checkpoint_index + 1
+                self.rings[self.checkpoint_index].hide()
+                self.checkpoint_index += 1
+
+                self.checkpoint_flash_text = f"CHECKPOINT {cleared_number} CLEARED!"
+                self.checkpoint_flash_until = time.monotonic() + 1.5
+
+                if self.checkpoint_index < len(self.rings):
+                    self.rings[self.checkpoint_index].show()
+                else:
+                    self.approach_ring.show()
+
+        elif self.airborne and not self.approach_gate_passed:
+            if distance3(pos, LANDING_APPROACH_GATE) <= APPROACH_RADIUS:
+                self.approach_gate_passed = True
+                self.approach_ring.hide()
+                self.checkpoint_flash_text = "APPROACH GATE CLEARED - LAND NOW"
+                self.checkpoint_flash_until = time.monotonic() + 2.0
+
+    def current_target(self) -> Point3:
+        if self.checkpoint_index < len(CHECKPOINTS):
+            return CHECKPOINTS[self.checkpoint_index]
+        if not self.approach_gate_passed:
+            return LANDING_APPROACH_GATE
+        return LANDING_TOUCHDOWN
+
+    # --------------------------------------------------------
+    # AUTOPILOT
+    # --------------------------------------------------------
+
+    def update_autopilot_request(self, state: ControllerState) -> None:
+        if state.autopilot_request != self.last_autopilot_request:
+            if state.autopilot_request:
+                if self.airborne and not self.crashed and not self.mission_complete:
+                    self.autopilot_active = True
+                else:
+                    self.autopilot_active = False
+                    self.autopilot_rejected_until = time.monotonic() + 2.5
+            else:
+                self.autopilot_active = False
+
+            self.last_autopilot_request = state.autopilot_request
+
+        if not self.airborne or self.crashed or self.mission_complete:
+            self.autopilot_active = False
+
+    # --------------------------------------------------------
+    # FLIGHT PHYSICS
+    # --------------------------------------------------------
+
+    def update_physics(self, state: ControllerState, dt: float) -> None:
+        if self.crashed:
+            self.speed *= max(0.0, 1.0 - dt * 1.2)
+            self.rpm *= max(0.0, 1.0 - dt * 1.5)
+            return
+
+        if self.mission_complete:
+            self.speed *= max(0.0, 1.0 - dt * 0.9)
+            self.rpm *= max(0.0, 1.0 - dt * 1.2)
+            return
+
+        # Engine
+        target_rpm = 700.0 + state.throttle * 48.0
+        if state.throttle < 2:
+            target_rpm = 650.0
+        if self.fuel <= 0:
+            target_rpm = 0.0
+
+        self.rpm += (target_rpm - self.rpm) * min(1.0, dt * 3.5)
+
+        if state.throttle > 0 and self.fuel > 0:
+            fuel_use = 0.003 + state.throttle * 0.00012
+            self.fuel = max(0.0, self.fuel - fuel_use * dt)
+
+        pitch_command = state.pitch
+        roll_command = state.roll
+
+        rudder_command = 0.0
+        if state.rudder_left:
+            rudder_command -= 100.0
+        if state.rudder_right:
+            rudder_command += 100.0
+
+        # Waypoint autopilot
+        if self.autopilot_active:
+            target = self.current_target()
+            pos = self.aircraft.getPos(self.render)
+            desired_heading = heading_between(pos, target)
+            heading_error = shortest_angle(desired_heading, self.heading)
+
+            roll_command = clamp(heading_error * 2.0, -55.0, 55.0)
+
+            target_z = target.z
+            if self.checkpoint_index >= len(CHECKPOINTS):
+                # Gentle approach instead of diving at runway ground.
+                if not self.approach_gate_passed:
+                    target_z = LANDING_APPROACH_GATE.z
+                else:
+                    horizontal = distance2(pos, LANDING_TOUCHDOWN)
+                    target_z = LANDING_TOUCHDOWN.z + clamp(horizontal * 0.10, 5.0, 45.0)
+
+            pitch_command = clamp(
+                (target_z - pos.z) * 0.8 - self.vertical_speed * 2.5,
+                -35.0,
+                35.0,
+            )
+
+        # Speed model
+        effective_throttle = state.throttle if self.fuel > 0 else 0.0
+        target_speed = effective_throttle * 0.84 - state.flaps * 0.28
+
+        if not self.airborne:
+            target_speed -= 4.0
+
+        target_speed = max(0.0, target_speed)
+        self.speed += (target_speed - self.speed) * min(1.0, dt * 1.8)
+
+        authority = clamp(self.speed / 31.0, 0.12, 1.0)
+        target_pitch = clamp(pitch_command, -100.0, 100.0) * 0.22
+        target_bank = -clamp(roll_command, -100.0, 100.0) * 0.42
+
+        self.pitch_angle += (target_pitch - self.pitch_angle) * min(1.0, dt * 3.0)
+        self.bank_angle += (target_bank - self.bank_angle) * min(1.0, dt * 4.0)
+
+        turn_rate = (-self.bank_angle * 0.10 + rudder_command * 0.018) * authority
+        self.heading = (self.heading + turn_rate * dt * 18.0) % 360.0
+
+        # Lift / vertical movement
+        lift = math.sin(math.radians(self.pitch_angle)) * self.speed * 0.51
+        flap_lift = state.flaps * 0.025 * clamp(self.speed / 30.0, 0.0, 1.5)
+        natural_sink = 4.7 * (1.0 - self.speed / 20.0) if self.speed < 20 else 0.8
+        target_vertical_speed = lift + flap_lift - natural_sink
+
+        self.vertical_speed += (
+            target_vertical_speed - self.vertical_speed
+        ) * min(1.0, dt * 2.4)
+
+        pos = self.aircraft.getPos(self.render)
+
+        # Before takeoff, follow the actual sloping takeoff runway height.
+        if not self.airborne:
+            runway_ground = interpolate_segment_z(pos, TAKEOFF_START, TAKEOFF_END)
+            if pos.z <= runway_ground + 0.15 and self.speed < 30:
+                self.vertical_speed = min(0.0, self.vertical_speed)
+
+        pos.z += self.vertical_speed * dt
+
+        heading_radians = math.radians(self.heading)
+        pos.x += math.sin(heading_radians) * self.speed * dt
+        pos.y += math.cos(heading_radians) * self.speed * dt
+
+        # Keep plane on the takeoff runway until it actually lifts.
+        if not self.airborne:
+            runway_ground = interpolate_segment_z(pos, TAKEOFF_START, TAKEOFF_END)
+            if pos.z < runway_ground:
+                pos.z = runway_ground
+                self.vertical_speed = 0.0
+
+            if pos.z > runway_ground + 5.5:
+                self.airborne = True
+
+        self.aircraft.setPos(pos)
+        self.aircraft.setHpr(-self.heading, -self.pitch_angle, self.bank_angle)
+
+        # Landing logic only near destination runway.
+        if self.airborne and self.checkpoint_index >= len(CHECKPOINTS):
+            self.handle_landing(state)
+
+    def handle_landing(self, state: ControllerState) -> None:
+        pos = self.aircraft.getPos(self.render)
+
+        runway_distance = point_to_segment_distance_2d(
+            pos,
+            LANDING_START,
+            LANDING_END,
+        )
+
+        near_destination = distance2(pos, LANDING_TOUCHDOWN) < 300.0
+        at_ground = pos.z <= LANDING_TOUCHDOWN.z + 1.0
+
+        if not (near_destination and runway_distance <= LANDING_RUNWAY_HALF_WIDTH and at_ground):
+            return
+
+        # Touch the runway surface.
+        pos.z = LANDING_TOUCHDOWN.z
+        self.aircraft.setPos(pos)
+
+        aligned = abs(shortest_angle(self.landing_heading, self.heading)) < 24.0
+        gentle = abs(self.vertical_speed) < 7.0 and abs(self.bank_angle) < 18.0
+        configured = state.gear and state.flaps >= 20
+        safe_speed = 16.0 <= self.speed <= 55.0
+
+        if aligned and gentle and configured and safe_speed and self.approach_gate_passed:
+            self.mission_complete = True
+            self.airborne = False
+            self.vertical_speed = 0.0
+            self.success_until = time.monotonic() + 8.0
+        elif abs(self.vertical_speed) > 10.0 or abs(self.bank_angle) > 30.0 or not state.gear:
+            self.crashed = True
+            self.airborne = False
+            self.speed = 0.0
+            self.vertical_speed = 0.0
+        else:
+            # A survivable but imperfect touchdown; keep rolling.
+            self.vertical_speed = 0.0
+
+    # --------------------------------------------------------
+    # CAMERA
+    # --------------------------------------------------------
+
+    def change_camera(self) -> None:
+        self.camera_mode = (self.camera_mode + 1) % 3
+
+    def update_camera(self, state: ControllerState) -> None:
+        if state.camera_counter != self.last_camera_counter:
+            self.change_camera()
+            self.last_camera_counter = state.camera_counter
+
+        if state.centre_counter != self.last_centre_counter:
+            self.camera_mode = 0
+            self.last_centre_counter = state.centre_counter
+
+        self.camera.reparentTo(self.aircraft)
+
+        if self.camera_mode == 0:      # Chase
+            self.camera.setPos(0, -30, 10)
+            self.camera.setHpr(0, -10, 0)
+        elif self.camera_mode == 1:    # Cockpit
+            self.camera.setPos(0, 2.8, 2.1)
+            self.camera.setHpr(0, 0, 0)
+        else:                          # High chase
+            self.camera.setPos(0, -46, 28)
+            self.camera.setHpr(0, -24, 0)
+
+    # --------------------------------------------------------
+    # MISSION TEXT + WARNINGS
+    # --------------------------------------------------------
+
+    def altitude_agl(self) -> float:
+        pos = self.aircraft.getPos(self.render)
+        if distance2(pos, LANDING_TOUCHDOWN) < 500:
+            return max(0.0, pos.z - LANDING_TOUCHDOWN.z)
+        return max(0.0, pos.z - TAKEOFF_START.z)
+
+    def mission_instruction(self, state: ControllerState) -> str:
+        if self.crashed:
+            return "CRASHED - PRESS R TO RESET"
+
+        if self.mission_complete:
+            return "MISSION COMPLETE - SAFE LANDING"
+
+        if time.monotonic() < self.checkpoint_flash_until:
+            return self.checkpoint_flash_text
+
+        if self.fuel <= 0:
+            return "ENGINE STOPPED - LAND IMMEDIATELY"
+
+        if not self.airborne:
+            if state.flaps != 10:
+                return "SET FLAPS TO 10"
+            if not state.gear:
+                return "KEEP LANDING GEAR DOWN"
+            if state.throttle < 90:
+                return "THROTTLE ABOVE 90%"
+            if self.speed < 34:
+                return "BUILD TAKEOFF SPEED"
+            return "PULL BACK GENTLY - TAKE OFF"
+
+        if self.checkpoint_index < len(CHECKPOINTS):
+            target = CHECKPOINTS[self.checkpoint_index]
+            distance = distance3(self.aircraft.getPos(self.render), target)
+            return f"FLY THROUGH CHECKPOINT {self.checkpoint_index + 1} - {distance:.0f} m"
+
+        if not self.approach_gate_passed:
+            if not state.gear:
+                return "APPROACH: LOWER LANDING GEAR"
+            if state.flaps < 20:
+                return "APPROACH: SET FLAPS 20 OR 30"
+            distance = distance3(self.aircraft.getPos(self.render), LANDING_APPROACH_GATE)
+            return f"FLY THROUGH LANDING APPROACH GATE - {distance:.0f} m"
+
+        pos = self.aircraft.getPos(self.render)
+        distance = distance2(pos, LANDING_TOUCHDOWN)
+
+        if not state.gear:
+            return "GEAR DOWN NOW"
+        if state.flaps < 20:
+            return "FLAPS 20 OR 30"
+        if abs(shortest_angle(self.landing_heading, self.heading)) > 20:
+            return "ALIGN WITH LANDING RUNWAY"
+        if self.speed > 55:
+            return "REDUCE SPEED"
+        if self.altitude_agl() > 18:
+            return f"DESCEND GENTLY - TOUCHDOWN {distance:.0f} m"
+
+        return "HOLD CENTRELINE - TOUCH DOWN"
+
+    def warning_flags(self, state: ControllerState):
+        altitude = self.altitude_agl()
+        stall = self.airborne and self.speed < 24 and self.pitch_angle > 8
+        overspeed = self.speed > 76
+        low_fuel = self.fuel <= 15
+        gear_warning = (
+            self.airborne
+            and self.checkpoint_index >= len(CHECKPOINTS)
+            and distance2(self.aircraft.getPos(self.render), LANDING_TOUCHDOWN) < 550
+            and altitude < 60
+            and self.vertical_speed < -0.5
+            and not state.gear
+        )
+        return stall, overspeed, low_fuel, gear_warning
+
+    def warning_state(self, state: ControllerState):
+        stall, overspeed, low_fuel, gear_warning = self.warning_flags(state)
+
+        if self.crashed:
+            return "CRASH", 3, 255, False, False, True
+        if self.mission_complete and time.monotonic() < self.success_until:
+            return "MISSION COMPLETE", 4, 130, True, False, False
+        if time.monotonic() < self.checkpoint_flash_until:
+            return "CHECKPOINT CLEARED", 1, 80, True, False, False
+        if stall:
+            return "STALL", 2, 255, False, False, True
+        if gear_warning:
+            return "GEAR NOT DOWN", 2, 180, False, True, True
+        if overspeed:
+            return "OVERSPEED", 2, 140, False, False, True
+        if self.fuel <= 0:
+            return "OUT OF FUEL", 3, 180, False, True, True
+        if low_fuel:
+            return "LOW FUEL", 1, 80, True, True, False
+
+        vibration = int(
+            clamp(
+                self.speed * 0.7 if self.altitude_agl() < 2 else abs(self.bank_angle) * 0.75,
+                0,
+                60,
+            )
+        )
+
+        if time.monotonic() < self.autopilot_rejected_until:
+            return "AUTOPILOT UNAVAILABLE", 1, 40, False, True, False
+        if self.autopilot_active:
+            return "AUTOPILOT", 0, vibration, True, False, False
+        if state.flaps > 0 or state.gear:
+            return "CONFIGURATION ACTIVE", 0, vibration, True, True, False
+        return "NORMAL", 0, vibration, True, False, False
+
+    # --------------------------------------------------------
+    # HUD
+    # --------------------------------------------------------
+
+    def create_hud(self) -> None:
+        self.top_panel = DirectFrame(
+            frameColor=(0.015, 0.05, 0.09, 0.88),
+            frameSize=(-1.32, 1.32, -0.17, 0.17),
+            pos=(0, 0, 0.82),
+        )
+
+        self.connection_label = DirectLabel(
+            parent=self.top_panel,
+            text="CONTROLLER: WAITING",
+            text_fg=(1, 0.85, 0.1, 1),
+            text_align=TextNode.ALeft,
+            text_scale=0.048,
+            frameColor=(0, 0, 0, 0),
+            pos=(-1.25, 0, 0.055),
+        )
+
+        self.mission_label = DirectLabel(
+            parent=self.top_panel,
+            text="MISSION: PREPARE FOR TAKEOFF",
+            text_fg=(1, 1, 1, 1),
+            text_align=TextNode.ALeft,
+            text_scale=0.037,
+            frameColor=(0, 0, 0, 0),
+            pos=(-1.25, 0, -0.065),
+        )
+
+        self.warning_label = DirectLabel(
+            text="FLIGHT ACTIVE",
+            text_fg=(0.3, 1.0, 0.35, 1),
+            text_scale=0.052,
+            frameColor=(0.015, 0.04, 0.07, 0.82),
+            pos=(0.82, 0, 0.62),
+        )
+
+        self.bottom_panel = DirectFrame(
+            frameColor=(0.015, 0.035, 0.055, 0.94),
+            frameSize=(-1.35, 1.35, -0.19, 0.19),
+            pos=(0, 0, -0.80),
+        )
+
+        headings = ["SPEED", "ALT", "HDG", "V/S", "THR", "FLAPS", "GEAR", "AUTO"]
+        positions = [-1.18, -0.86, -0.54, -0.22, 0.18, 0.52, 0.84, 1.15]
+        self.instrument_labels = []
+
+        for heading_text, x in zip(headings, positions):
+            DirectLabel(
+                parent=self.bottom_panel,
+                text=heading_text,
+                text_fg=(0.65, 0.72, 0.80, 1),
+                text_scale=0.032,
+                frameColor=(0, 0, 0, 0),
+                pos=(x, 0, 0.09),
+            )
+
+            value = DirectLabel(
+                parent=self.bottom_panel,
+                text="0",
+                text_fg=(1, 1, 1, 1),
+                text_scale=0.048,
+                frameColor=(0, 0, 0, 0),
+                pos=(x, 0, -0.035),
+            )
+            self.instrument_labels.append(value)
+
+        self.control_help = DirectLabel(
+            text=(
+                "Joystick pitch/roll | Encoder throttle | B1/B2 rudder | "
+                "B3/B4 flaps | Gear toggle | B5 camera | B6 autopilot"
+            ),
+            text_fg=(1, 1, 1, 1),
+            text_scale=0.024,
+            frameColor=(0.015, 0.04, 0.07, 0.82),
+            pos=(0, 0, -0.61),
+        )
+
+    def update_hud(self, state: ControllerState, connected: bool, warning: str) -> None:
+        self.connection_label["text"] = (
+            "CONTROLLER: CONNECTED" if connected else "CONTROLLER: KEYBOARD MODE"
+        )
+        self.connection_label["text_fg"] = (
+            (0.3, 1.0, 0.35, 1) if connected else (1.0, 0.85, 0.1, 1)
+        )
+
+        self.mission_label["text"] = "MISSION: " + self.mission_instruction(state)
+
+        display_warning = (
+            "FLIGHT ACTIVE" if warning in ("NORMAL", "CONFIGURATION ACTIVE") else warning
+        )
+        self.warning_label["text"] = display_warning
+
+        if warning in ("CRASH", "STALL", "OVERSPEED", "GEAR NOT DOWN"):
+            self.warning_label["text_fg"] = (1.0, 0.2, 0.2, 1)
+        elif warning in ("LOW FUEL", "OUT OF FUEL", "AUTOPILOT UNAVAILABLE"):
+            self.warning_label["text_fg"] = (1.0, 0.85, 0.1, 1)
+        else:
+            self.warning_label["text_fg"] = (0.3, 1.0, 0.35, 1)
+
+        values = [
+            f"{self.speed:03.0f}",
+            f"{self.altitude_agl():03.0f}",
+            f"{self.heading % 360:03.0f}",
+            f"{self.vertical_speed:+.1f}",
+            f"{state.throttle:03.0f}%",
+            f"{state.flaps:02d}",
+            "DOWN" if state.gear else "UP",
+            "ON" if self.autopilot_active else "OFF",
+        ]
+
+        for label, value in zip(self.instrument_labels, values):
+            label["text"] = value
+
+    # --------------------------------------------------------
+    # ESP32 FEEDBACK
+    # --------------------------------------------------------
+
+    def send_feedback(
+        self,
+        state: ControllerState,
+        warning: str,
+        buzzer: int,
+        vibration: int,
+        green: bool,
+        yellow: bool,
+        red: bool,
+    ) -> None:
+        """
+        Send the exact feedback protocol expected by your FINAL ESP32 code:
+
+        MISSION=...;
+        WARN=...;
+        ALT=...;
+        SPD=...;
+        STATUS=...;
+        VIB=milliseconds;
+        BEEP=milliseconds;
+        """
+
+        if state.sender_ip is None:
+            return
+
+        if time.monotonic() - self.last_feedback_send < 0.10:
+            return
+
+        self.last_feedback_send = time.monotonic()
+
+        mission = self.mission_instruction(state)
+
+        # IMPORTANT:
+        # Your remote treats ANY non-empty WARN field as danger.
+        # Therefore normal/configuration/autopilot/checkpoint states send
+        # an EMPTY WARN field.
+        danger_warnings = {
+            "CRASH",
+            "STALL",
+            "GEAR NOT DOWN",
+            "OVERSPEED",
+            "OUT OF FUEL",
+            "LOW FUEL",
+        }
+
+        warn_text = warning if warning in danger_warnings else ""
+
+        if self.crashed:
+            status = "CRASH"
+        elif self.mission_complete:
+            status = "DONE"
+        elif self.autopilot_active:
+            status = "AUTO"
+        elif self.airborne:
+            status = "FLY"
+        else:
+            status = "READY"
+
+        # Your ESP32 interprets VIB and BEEP as DURATION IN MILLISECONDS.
+        vib_ms = 0
+        beep_ms = 0
+
+        if warning == "CRASH":
+            vib_ms = 900
+            beep_ms = 900
+
+        elif warning in ("STALL", "GEAR NOT DOWN", "OVERSPEED"):
+            vib_ms = 320
+            beep_ms = 260
+
+        elif warning in ("OUT OF FUEL", "LOW FUEL"):
+            vib_ms = 120
+            beep_ms = 140
+
+        elif warning == "CHECKPOINT CLEARED":
+            vib_ms = 100
+            beep_ms = 90
+
+        elif warning == "MISSION COMPLETE":
+            vib_ms = 300
+            beep_ms = 350
+
+        # Keep mission text protocol-safe.
+        mission = mission.replace(";", ",").replace("\n", " ")
+        warn_text = warn_text.replace(";", ",").replace("\n", " ")
+
+        packet = (
+            f"MISSION={mission};"
+            f"WARN={warn_text};"
+            f"ALT={int(round(self.altitude_agl()))};"
+            f"SPD={int(round(self.speed))};"
+            f"STATUS={status};"
+            f"VIB={vib_ms};"
+            f"BEEP={beep_ms}"
+        )
+
+        try:
+            feedback_socket.sendto(
+                packet.encode("utf-8"),
+                (state.sender_ip, FEEDBACK_PORT),
+            )
+        except OSError:
+            pass
+
+    # --------------------------------------------------------
+    # RESET / MAIN LOOP
+    # --------------------------------------------------------
+
+    def reset_game(self) -> None:
+        self.speed = 0.0
+        self.vertical_speed = 0.0
+        self.heading = self.takeoff_heading
+        self.pitch_angle = 0.0
+        self.bank_angle = 0.0
+        self.fuel = 100.0
+        self.rpm = 0.0
+
+        self.airborne = False
+        self.crashed = False
+        self.mission_complete = False
+        self.approach_gate_passed = False
+        self.checkpoint_index = 0
+        self.checkpoint_flash_until = 0.0
+        self.checkpoint_flash_text = ""
+        self.success_until = 0.0
+
+        self.autopilot_active = False
+        self.last_autopilot_request = False
+        self.autopilot_rejected_until = 0.0
+
+        self.aircraft.setPos(TAKEOFF_START)
+        self.aircraft.setHpr(-self.takeoff_heading, 0, 0)
+
+        for index, ring in enumerate(self.rings):
+            if index == 0:
+                ring.show()
+            else:
+                ring.hide()
+        self.approach_ring.hide()
+
+    def update_game(self, task: Task):
+        dt = min(ClockObject.getGlobalClock().getDt(), 0.05)
+
+        state = controller_snapshot()
+        connected = controller_connected(state)
+        state = self.keyboard_fallback(state, dt)
+
+        self.update_autopilot_request(state)
+        self.update_physics(state, dt)
+        self.update_mission_progress()
+        self.update_camera(state)
+
+        warning, buzzer, vibration, green, yellow, red = self.warning_state(state)
+        self.update_hud(state, connected, warning)
+        self.send_feedback(state, warning, buzzer, vibration, green, yellow, red)
+
+        return Task.cont
+
+    def close_game(self) -> None:
+        global network_running
+        network_running = False
+
+        try:
+            feedback_socket.close()
+        except OSError:
+            pass
+
+        self.userExit()
+
+
+# ============================================================
+# START
+# ============================================================
+
+if __name__ == "__main__":
+    game = AviationMissionGame()
+
+    try:
+        game.run()
+    finally:
+        network_running = False
+        try:
+            feedback_socket.close()
+        except OSError:
+            pass
